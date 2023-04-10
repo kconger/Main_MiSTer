@@ -11,9 +11,6 @@
 // Archie support
 #include "support/archie/archie.h"
 
-// PCXT support
-#include "support/pcxt/pcxt.h"
-
 // ST (Atari) support
 #include "support/st/st_tos.h"
 
@@ -25,6 +22,8 @@
 
 // NeoGeo  support
 #include "support/neogeo/neogeo_loader.h"
+#include "support/neogeo/neogeocd.h"
+
 
 // Arcade support
 #include "support/arcade/mra_loader.h"

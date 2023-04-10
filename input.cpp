@@ -25,6 +25,7 @@
 #include "fpga_io.h"
 #include "osd.h"
 #include "video.h"
+#include "audio.h"
 #include "joymapping.h"
 #include "support.h"
 #include "profiling.h"
@@ -1752,7 +1753,7 @@ static void joy_digital(int jnum, uint32_t mask, uint32_t code, char press, int 
 			}
 			else
 			{
-				if (!user_io_osd_is_visible() && press)
+				if (!user_io_osd_is_visible() && press && !cfg.disable_autofire)
 				{
 					if (lastcode[num] && lastmask[num])
 					{
@@ -1847,6 +1848,7 @@ static void joy_digital(int jnum, uint32_t mask, uint32_t code, char press, int 
 
 		if (user_io_osd_is_visible() || (bnum == BTN_OSD))
 		{
+			mask &= ~JOY_BTN3;
 			if (press)
 			{
 				osdbtn |= mask;
@@ -1951,6 +1953,10 @@ static void joy_digital(int jnum, uint32_t mask, uint32_t code, char press, int 
 				ev.code = KEY_EQUAL;
 				break;
 
+			case JOY_R2:
+				ev.code = KEY_GRAVE;
+				break;
+
 			default:
 				ev.code = (bnum == BTN_OSD) ? KEY_MENU : 0;
 			}
@@ -1991,6 +1997,14 @@ static void joy_digital(int jnum, uint32_t mask, uint32_t code, char press, int 
 
 			case JOY_BTN4:
 				uinp_send_key(KEY_TAB, press);
+				break;
+
+			case JOY_L:
+				uinp_send_key(KEY_PAGEUP, press);
+				break;
+
+			case JOY_R:
+				uinp_send_key(KEY_PAGEDOWN, press);
 				break;
 			}
 		}
@@ -2235,6 +2249,14 @@ static uint16_t def_mmap[] = {
 	0x0000, 0x0002, 0x0001, 0x0002, 0x0000, 0x0000, 0x0000, 0x0000
 };
 
+static void assign_player(int dev, int num)
+{
+	input[dev].num = num;
+	if (JOYCON_COMBINED(dev)) input[input[dev].bind].num = num;
+	store_player(num, dev);
+	printf("Device %s assigned to player %d\n", input[dev].id, input[dev].num);
+}
+
 static void input_cb(struct input_event *ev, struct input_absinfo *absinfo, int dev)
 {
 	if (ev->type != EV_KEY && ev->type != EV_ABS && ev->type != EV_REL) return;
@@ -2294,6 +2316,8 @@ static void input_cb(struct input_event *ev, struct input_absinfo *absinfo, int 
 					memcpy(input[dev].mmap, def_mmap, sizeof(def_mmap));
 					//input[dev].has_mmap++;
 				}
+			} else {
+				gcdb_show_string_for_ctrl_map(input[sub_dev].bustype, input[sub_dev].vid, input[sub_dev].pid, input[sub_dev].version, pool[sub_dev].fd, input[sub_dev].name, input[dev].mmap);
 			}
 			if (!input[dev].mmap[SYS_BTN_OSD_KTGL + 2]) input[dev].mmap[SYS_BTN_OSD_KTGL + 2] = input[dev].mmap[SYS_BTN_OSD_KTGL + 1];
 
@@ -2372,29 +2396,47 @@ static void input_cb(struct input_event *ev, struct input_absinfo *absinfo, int 
 
 		if (assign_btn)
 		{
-			for (uint8_t num = 1; num < NUMDEV + 1; num++)
+			for (uint8_t i = 0; i < (sizeof(cfg.player_controller) / sizeof(cfg.player_controller[0])); i++)
 			{
-				int found = 0;
-				for (int i = 0; i < NUMDEV; i++)
+				if (cfg.player_controller[i][0])
 				{
-					if (input[i].quirk != QUIRK_TOUCHGUN)
+					if (strcasestr(input[dev].id, cfg.player_controller[i]))
 					{
-						// paddles/spinners overlay on top of other gamepad
-						if (!((input[dev].quirk == QUIRK_PDSP || input[dev].quirk == QUIRK_MSSP) ^ (input[i].quirk == QUIRK_PDSP || input[i].quirk == QUIRK_MSSP)))
-						{
-							found = (input[i].num == num);
-							if (found) break;
-						}
+						assign_player(dev, i + 1);
+						break;
+					}
+
+					if (strcasestr(input[dev].sysfs, cfg.player_controller[i]))
+					{
+						assign_player(dev, i + 1);
+						break;
 					}
 				}
+			}
 
-				if (!found)
+			if (!input[dev].num)
+			{
+				for (uint8_t num = 1; num < NUMDEV + 1; num++)
 				{
-					input[dev].num = num;
-					if (JOYCON_COMBINED(dev)) input[input[dev].bind].num = num;
-					store_player(num, dev);
-					printf("Device %s assigned to player %d\n", input[dev].id, input[dev].num);
-					break;
+					int found = 0;
+					for (int i = 0; i < NUMDEV; i++)
+					{
+						if (input[i].quirk != QUIRK_TOUCHGUN)
+						{
+							// paddles/spinners overlay on top of other gamepad
+							if (!((input[dev].quirk == QUIRK_PDSP || input[dev].quirk == QUIRK_MSSP) ^ (input[i].quirk == QUIRK_PDSP || input[i].quirk == QUIRK_MSSP)))
+							{
+								found = (input[i].num == num);
+								if (found) break;
+							}
+						}
+					}
+
+					if (!found)
+					{
+						assign_player(dev, num);
+						break;
+					}
 				}
 			}
 		}
@@ -2806,16 +2848,24 @@ static void input_cb(struct input_event *ev, struct input_absinfo *absinfo, int 
 							joy_digital(0, JOY_BTN1, 0, ev->value, 0);
 							return;
 						}
-						else if ((input[dev].mmap[SYS_BTN_MENU_FUNC] >> 16) ?
+
+						if ((input[dev].mmap[SYS_BTN_MENU_FUNC] >> 16) ?
 							(ev->code == (input[dev].mmap[SYS_BTN_MENU_FUNC] >> 16)) :
 							(ev->code == input[dev].mmap[SYS_BTN_B]))
 						{
 							joy_digital(0, JOY_BTN2, 0, ev->value, 0);
 							return;
 						}
-						else if (ev->code == input[dev].mmap[SYS_BTN_X])
+
+						if (ev->code == input[dev].mmap[SYS_BTN_X])
 						{
 							joy_digital(0, JOY_BTN4, 0, ev->value, 0);
+							return;
+						}
+
+						if (ev->code == input[dev].mmap[SYS_BTN_Y])
+						{
+							joy_digital(0, JOY_BTN3, 0, ev->value, 0);
 							return;
 						}
 
@@ -2831,11 +2881,15 @@ static void input_cb(struct input_event *ev, struct input_absinfo *absinfo, int 
 							return;
 						}
 
+						if (ev->code == input[dev].mmap[SYS_BTN_START])
+						{
+							joy_digital(0, JOY_L2, 0, ev->value, 0);
+							return;
+						}
+
 						if (ev->code == input[dev].mmap[SYS_BTN_SELECT])
 						{
-							struct input_event key_ev = *ev;
-							key_ev.code = KEY_GRAVE;
-							input_cb(&key_ev, 0, 0);
+							joy_digital(0, JOY_R2, 0, ev->value, 0);
 							return;
 						}
 
@@ -5067,9 +5121,10 @@ int input_test(int getchar)
 								continue;
 							}
 
-							int xval, yval;
+							int xval, yval, zval;
 							xval = ((data[0] & 0x10) ? -256 : 0) | data[1];
 							yval = ((data[0] & 0x20) ? -256 : 0) | data[2];
+							zval = ((data[3] & 0x80) ? -256 : 0) | data[3];
 
 							input_absinfo absinfo = {};
 							absinfo.maximum = 255;
@@ -5077,7 +5132,14 @@ int input_test(int getchar)
 
 							if (input[dev].quirk == QUIRK_MSSP)
 							{
-								int val = cfg.spinner_axis ? yval : xval;
+								int val;
+								if(cfg.spinner_axis == 0)
+									val = xval;
+								else if(cfg.spinner_axis == 1)
+									val = yval;
+								else
+									val = zval;
+
 								int btn = (data[0] & 7) ? 1 : 0;
 								if (input[i].misc_flags != btn)
 								{
@@ -5141,6 +5203,12 @@ int input_test(int getchar)
 					else if (!strncmp(cmd, "screenshot", 10))
 					{
 						user_io_screenshot_cmd(cmd);
+					}
+					else if (!strncmp(cmd, "volume ", 7))
+					{
+						if (!strcmp(cmd + 7, "mute")) set_volume(0x81);
+						else if (!strcmp(cmd + 7, "unmute")) set_volume(0x80);
+						else if (cmd[7] >= '0' && cmd[7] <= '7') set_volume(0x40 - 0x30 + cmd[7]);
 					}
 				}
 			}

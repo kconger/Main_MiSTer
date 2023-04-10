@@ -70,6 +70,7 @@ static char keyboard_leds = 0;
 static bool caps_status = 0;
 static bool num_status = 0;
 static bool scrl_status = 0;
+static bool winkey_pressed = 0;
 
 static uint16_t sdram_cfg = 0;
 
@@ -114,7 +115,9 @@ unsigned char user_io_core_type()
 	return core_type;
 }
 
-char* user_io_create_config_name()
+static char config_ver[10] = {};
+
+char* user_io_create_config_name(int with_ver)
 {
 	static char str[40];
 	str[0] = 0;
@@ -122,6 +125,7 @@ char* user_io_create_config_name()
 	if (p[0])
 	{
 		strcpy(str, p);
+		if (with_ver) strcat(str, config_ver);
 		strcat(str, ".CFG");
 	}
 	return str;
@@ -227,6 +231,10 @@ char is_neogeo()
 	return (is_neogeo_type == 1);
 }
 
+char is_neogeo_cd() {
+    return is_neogeo() && neocd_is_en();
+}
+
 static int is_minimig_type = 0;
 char is_minimig()
 {
@@ -274,6 +282,13 @@ char is_c64()
 {
 	if (!is_c64_type) is_c64_type = strcasecmp(orig_name, "C64") ? 2 : 1;
 	return (is_c64_type == 1);
+}
+
+static int is_c128_type = 0;
+char is_c128()
+{
+	if (!is_c128_type) is_c128_type = strcasecmp(orig_name, "C128") ? 2 : 1;
+	return (is_c128_type == 1);
 }
 
 static int is_psx_type = 0;
@@ -336,6 +351,7 @@ void user_io_read_core_name()
 	is_archie_type = 0;
 	is_gba_type = 0;
 	is_c64_type = 0;
+	is_c128_type = 0;
 	is_st_type = 0;
 	is_pcxt_type = 0;
 	core_name[0] = 0;
@@ -782,6 +798,15 @@ static void parse_config()
 				OsdCoreNameSet(s);
 			}
 
+			if (p[0] == 'v')
+			{
+				static char str[256];
+				substrcpy(str, p, 1);
+				str[2] = 0;
+				int v = strtoul(str, 0, 10);
+				if(v) snprintf(config_ver, sizeof(config_ver), "_v%d", v);
+			}
+
 			if (p[0] == 'C')
 			{
 				use_cheats = 1;
@@ -836,7 +861,7 @@ static void parse_config()
 				{
 					int idx = p[2] - '0';
 					StoreIdx_S(idx, str);
-					if (is_x86())
+					if (is_x86() || is_pcxt())
 					{
 						x86_set_image(idx, str);
 					}
@@ -851,7 +876,8 @@ static void parse_config()
 					}
 					else
 					{
-						user_io_set_index(user_io_ext_idx(str, ext) << 6 | idx);
+						if (!is_c128())
+							user_io_set_index(user_io_ext_idx(str, ext) << 6 | idx);
 						user_io_file_mount(str, idx);
 					}
 				}
@@ -1280,7 +1306,7 @@ void user_io_init(const char *path, const char *xml)
 	if (xml)
 	{
 		if (isXmlName(xml) == 1) is_arcade_type = 1;
-		arcade_override_name(xml);
+		arcade_pre_parse(xml);
 	}
 
 	if (core_type == CORE_TYPE_8BIT)
@@ -1300,6 +1326,7 @@ void user_io_init(const char *path, const char *xml)
 	user_io_read_core_name();
 
 	cfg_parse();
+	cfg_print();
 	while (cfg.waitmount[0] && !is_menu())
 	{
 		printf("> > > wait for %s mount < < <\n", cfg.waitmount);
@@ -1318,7 +1345,7 @@ void user_io_init(const char *path, const char *xml)
 		xml = (const char*)defmra;
 		strcpy(core_path, xml);
 		is_arcade_type = 1;
-		arcade_override_name(xml);
+		arcade_pre_parse(xml);
 		user_io_read_core_name();
 		printf("Using default MRA: %s\n", xml);
 	}
@@ -1352,7 +1379,7 @@ void user_io_init(const char *path, const char *xml)
 
 	case CORE_TYPE_8BIT:
 		// try to load config
-		name = user_io_create_config_name();
+		name = user_io_create_config_name(1);
 		if (strlen(name) > 0)
 		{
 			if (!is_st() && !is_minimig())
@@ -1372,6 +1399,7 @@ void user_io_init(const char *path, const char *xml)
 				user_io_status_set("[0]", 1);
 			}
 
+			name = user_io_create_config_name();
 			if (is_st())
 			{
 				tos_config_load(0);
@@ -1394,7 +1422,7 @@ void user_io_init(const char *path, const char *xml)
 					printf("Identified Minimig V2 core");
 					BootInit();
 				}
-				else if (is_x86())
+				else if (is_x86() || is_pcxt())
 				{
 					x86_config_load();
 					x86_init();
@@ -1403,11 +1431,6 @@ void user_io_init(const char *path, const char *xml)
 				{
 					printf("Identified Archimedes core");
 					archie_init();
-				}
-				else if (is_pcxt())
-				{
-					pcxt_config_load();
-					pcxt_init();
 				}
 				else
 				{
@@ -1505,6 +1528,13 @@ void user_io_init(const char *path, const char *xml)
 		// release reset
 		if (!is_minimig() && !is_st()) user_io_status_set("[0]", 0);
 		if (xml && isXmlName(xml) == 1) arcade_check_error();
+
+		char cfg_errs[512];
+		if (cfg_check_errors(cfg_errs, sizeof(cfg_errs)))
+		{
+			Info(cfg_errs, 5000);
+			sleep(5);
+		}
 		break;
 	}
 
@@ -1897,6 +1927,7 @@ int user_io_file_mount(const char *name, unsigned char index, char pre, int pre_
 	int writable = 0;
 	int ret = 0;
 	int len = strlen(name);
+	int img_type = 0; // disk image type (for C128 core): bit 0=dual sided, 1=raw GCR supported, 2=raw MFM supported, 3=high density
 
 	sd_image_cangrow[index] = (pre != 0);
 	sd_type[index] = 0;
@@ -1920,20 +1951,43 @@ int user_io_file_mount(const char *name, unsigned char index, char pre, int pre_
 				ret = c64_openT64(name, sd_image + index);
 				if (ret)
 				{
-					ret = c64_openGCR(name, sd_image + index, index);
+					img_type = c64_openGCR(name, sd_image + index, index);
+					ret = img_type < 0 ? 0 : 1;
 					sd_type[index] = 1;
 					if (!ret) FileClose(&sd_image[index]);
+
+					if (ret && is_c128())
+					{
+						printf("Disk image type: %d\n", img_type);
+						user_io_set_aindex(img_type << 6 | index);
+					}
 				}
 			}
 			else
 			{
 				writable = FileCanWrite(name);
 				ret = FileOpenEx(&sd_image[index], name, writable ? (O_RDWR | O_SYNC) : O_RDONLY);
-				if (ret && len > 4 && (!strcasecmp(name + len - 4, ".d64") || !strcasecmp(name + len - 4, ".g64")))
+				if (ret && len > 4) {
+					if (!strcasecmp(name + len - 4, ".d64")
+						|| !strcasecmp(name + len - 4, ".g64")
+						|| !strcasecmp(name + len - 4, ".d71")
+						|| !strcasecmp(name + len - 4, ".g71"))
+					{
+						img_type = c64_openGCR(name, sd_image + index, index);
+						ret = img_type < 0 ? 0 : 1;
+						sd_type[index] = 1;
+						if(!ret) FileClose(&sd_image[index]);
+					}
+					else if (!strcasecmp(name + len - 4, ".d81"))
+					{
+						img_type = G64_SUPPORT_HD | G64_SUPPORT_DS;
+					}
+				}
+
+				if (ret && is_c128())
 				{
-					ret = c64_openGCR(name, sd_image + index, index);
-					sd_type[index] = 1;
-					if(!ret) FileClose(&sd_image[index]);
+					printf("Disk image type: %d\n", img_type);
+					user_io_set_aindex(img_type << 6 | index);
 				}
 			}
 		}
@@ -2694,7 +2748,7 @@ void user_io_send_buttons(char force)
 	if (cfg.vga_scaler) map |= CONF_VGA_SCALER;
 	if (cfg.vga_sog) map |= CONF_VGA_SOG;
 	if (cfg.csync) map |= CONF_CSYNC;
-	if (cfg.ypbpr) map |= CONF_YPBPR;
+	if (cfg.vga_mode_int == 1) map |= CONF_YPBPR;
 	if (cfg.forced_scandoubler) map |= CONF_FORCED_SCANDOUBLER;
 	if (cfg.hdmi_audio_96k) map |= CONF_AUDIO_96K;
 	if (cfg.dvi_mode == 1) map |= CONF_DVI;
@@ -2720,9 +2774,11 @@ void user_io_send_buttons(char force)
 		{
 			if (is_minimig()) minimig_reset();
 			if (is_megacd()) mcd_reset();
+			if (is_neogeo_cd()) neocd_reset();
 			if (is_pce()) pcecd_reset();
 			if (is_saturn()) saturn_reset();
-			if (is_x86()) x86_init();
+			if (is_x86() || is_pcxt()) x86_init();
+			if (is_st()) tos_reset(0);
 			ResetUART();
 		}
 
@@ -2852,7 +2908,7 @@ void user_io_poll()
 	}
 
 	// sd card emulation
-	if (is_x86())
+	if (is_x86() || is_pcxt())
 	{
 		x86_poll();
 	}
@@ -2936,10 +2992,10 @@ void user_io_poll()
 			}
 			DisableIO();
 
-			if ((blks == 32) && sd_type[disk])
+			if ((blks == G64_BLOCK_COUNT_1541+1 || blks == G64_BLOCK_COUNT_1571+1) && sd_type[disk])
 			{
-				if (op == 2) c64_writeGCR(disk, lba);
-				else if (op & 1) c64_readGCR(disk, lba);
+				if (op == 2) c64_writeGCR(disk, lba, blks-1);
+				else if (op & 1) c64_readGCR(disk, lba, blks-1);
 				else break;
 			}
 			else if (op == 2)
@@ -3387,11 +3443,25 @@ void user_io_poll()
 	if (is_pce()) pcecd_poll();
 	if (is_saturn()) saturn_poll();
 	if (is_psx()) psx_poll();
+	if (is_neogeo_cd()) neocd_poll();
 	process_ss(0);
 }
 
 static void send_keycode(unsigned short key, int press)
 {
+	if (is_pcxt())
+	{
+		//WIN+... we override this hotkey in the core.
+		if (key == 125 || key == 126)
+		{
+			winkey_pressed = press;
+			return;
+		}
+		if (winkey_pressed)
+		{
+			return;
+		}
+	}
 	if (is_minimig())
 	{
 		if (press > 1) return;
@@ -3733,6 +3803,8 @@ void user_io_osd_key_enable(char on)
 
 void user_io_kbd(uint16_t key, int press)
 {
+	static int block_F12 = 0;
+
 	if(is_menu()) spi_uio_cmd(UIO_KEYBOARD); //ping the Menu core to wakeup
 
 	// Win+PrnScr or Alt/Win+ScrLk - screen shot
@@ -3789,10 +3861,14 @@ void user_io_kbd(uint16_t key, int press)
 				if (is_menu() && !video_fb_state()) printf("PS2 code(break)%s for core: %d(0x%X)\n", (code & EXT) ? "(ext)" : "", code & 255, code & 255);
 
 				if (key == KEY_MENU) key = KEY_F12;
-				if (osd_is_visible) menu_key_set(UPSTROKE | key);
+				if (key != KEY_F12 || !block_F12)
+				{
+					if (osd_is_visible) menu_key_set(UPSTROKE | key);
 
-				//don't block depress so keys won't stick in core if pressed before OSD.
-				send_keycode(key, press);
+					// these modifiers should be passed to core even if OSD is open or they will get stuck!
+					if (!osd_is_visible || key == KEY_LEFTALT || key == KEY_RIGHTALT || key == KEY_LEFTMETA || key == KEY_RIGHTMETA) send_keycode(key, press);
+				}
+				if (key == KEY_F12) block_F12 = 0;
 			}
 			else
 			{
@@ -3800,10 +3876,13 @@ void user_io_kbd(uint16_t key, int press)
 				if (!osd_is_visible && !is_menu() && key == KEY_MENU && press == 3) open_joystick_setup();
 				else if ((has_menu() || osd_is_visible || (get_key_mod() & (LALT | RALT | RGUI | LGUI))) && (((key == KEY_F12) && ((!is_x86() && !is_pcxt() && !is_archie()) || (get_key_mod() & (RGUI | LGUI)))) || key == KEY_MENU))
 				{
+					block_F12 = 1;
 					if (press == 1) menu_key_set(KEY_F12);
 				}
 				else if (osd_is_visible)
 				{
+					if (key == KEY_MENU) key = KEY_F12;
+					if (key == KEY_F12) block_F12 = 1;
 					if (press == 1) menu_key_set(key);
 				}
 				else
