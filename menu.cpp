@@ -79,6 +79,9 @@ enum MENU
 	MENU_MISC1,
 	MENU_MISC2,
 
+	MENU_SELECT_INI1,
+	MENU_SELECT_INI2,
+
 	MENU_FILE_SELECT1,
 	MENU_FILE_SELECT2,
 	MENU_CORE_FILE_SELECTED1,
@@ -92,6 +95,9 @@ enum MENU
 	MENU_ABOUT2,
 	MENU_RESET1,
 	MENU_RESET2,
+	MENU_UNLOCK1,
+	MENU_UNLOCK2,
+	MENU_UNLOCK3,
 
 	MENU_JOYSYSMAP,
 	MENU_JOYDIGMAP,
@@ -103,8 +109,10 @@ enum MENU
 	MENU_JOYRESET1,
 	MENU_JOYKBDMAP,
 	MENU_JOYKBDMAP1,
+	MENU_JOYKBDMAP2,
 	MENU_KBDMAP,
 	MENU_KBDMAP1,
+	MENU_KBDMAP2,
 	MENU_BTPAIR,
 	MENU_BTPAIR2,
 	MENU_LGCAL,
@@ -202,6 +210,11 @@ static uint32_t menu_timer = 0;
 static uint32_t menu_save_timer = 0;
 static uint32_t load_addr = 0;
 static int32_t  bt_timer = 0;
+
+static bool osd_unlocked = 1;
+static char osd_code_entry[32];
+static uint32_t osd_lock_timer = 0;
+
 
 extern const char *version;
 
@@ -390,14 +403,17 @@ void SelectFile(const char* path, const char* pFileExt, int Options, unsigned ch
 	}
 	else
 	{
-		const char *home = is_menu() ? "Scripts" : user_io_get_core_path((is_pce() && !strncasecmp(pFileExt, "CUE", 3)) ? PCECD_DIR : NULL, 1);
+		const char *home = is_menu() ? "Scripts" : user_io_get_core_path(
+			(is_pce() && !strncasecmp(pFileExt, "CUE", 3)) ? PCECD_DIR :
+			(is_neogeo() && !strncasecmp(pFileExt, "CUE", 3)) ? NEOCD_DIR :
+			NULL, 1);
 		home_dir = strrchr(home, '/');
 		if (home_dir) home_dir++;
 		else home_dir = home;
 
 		if (Options & SCANO_SAVES)
 		{
-			snprintf(tmp, sizeof(tmp), "%s/%s", SAVE_DIR, CoreName);
+			snprintf(tmp, sizeof(tmp), "%s/%s", SAVE_DIR, CoreName2);
 			home = tmp;
 		}
 
@@ -444,6 +460,12 @@ static uint8_t GetASCIIKey(uint32_t keycode)
 		return 0;
 
 	return keycode_table[get_amiga_code(keycode & 0xFFFF) & 0x7F];
+}
+
+static int select_ini = 0;
+void SelectINI()
+{
+	select_ini = 1;
 }
 
 /* the Atari core handles OSD keys competely inside the core */
@@ -501,7 +523,7 @@ static uint32_t menu_key_get(void)
 	}
 
 	// currently no key pressed
-	if (!c)
+	if (!c && !select_ini)
 	{
 		static unsigned long longpress = 0, longpress_consumed = 0;
 		static unsigned char last_but = 0;
@@ -545,7 +567,11 @@ static uint32_t menu_key_get(void)
 
 			if (!but && last_but && !longpress_consumed)
 			{
-				if (get_map_vid() || get_map_pid())
+				if (select_ini)
+				{
+					c = KEY_ESC | UPSTROKE;
+				}
+				else if (get_map_vid() || get_map_pid())
 				{
 					send_map_cmd(KEY_ALTERASE);
 				}
@@ -949,7 +975,7 @@ void HandleUI(void)
 	static int has_fb_terminal = 0;
 	static unsigned long flash_timer = 0;
 	static int flash_state = 0;
-	static uint32_t dip_submenu, dip2_submenu, dipv;
+	static uint32_t dip_submenu;
 	static int need_reset = 0;
 	static int flat = 0;
 	static int menusub_parent = 0;
@@ -958,6 +984,9 @@ void HandleUI(void)
 	static char addon[1024];
 	static int store_name;
 	static int vfilter_type;
+	static int old_volume = 0;
+	static uint32_t lock_pass_timeout = 0;
+	static uint32_t menu_timeout = 0;
 
 	static char	cp_MenuCancel;
 
@@ -1039,7 +1068,7 @@ void HandleUI(void)
 
 	if (c && cfg.bootcore[0] != '\0') cfg.bootcore[0] = '\0';
 
-	if (is_menu() && cfg.osd_timeout >= 5)
+	if (!select_ini && is_menu() && cfg.osd_timeout >= 5)
 	{
 		static int menu_visible = 1;
 		static unsigned long timeout = 0;
@@ -1094,7 +1123,7 @@ void HandleUI(void)
 	}
 
 	//prevent OSD control while script is executing on framebuffer
-	if (!video_fb_state() || video_chvt(0) != 2)
+	if ((!video_fb_state() || video_chvt(0) != 2) && !select_ini)
 	{
 		switch (c)
 		{
@@ -1150,11 +1179,11 @@ void HandleUI(void)
 			if (menustate != MENU_NONE2) menu = true;
 			break;
 		case KEY_BACK | UPSTROKE:
-			if (saved_menustate) back = true;
+			if (saved_menustate || !osd_unlocked) back = true;
 			else menu = true;
 			break;
 		case KEY_BACKSPACE | UPSTROKE:
-			if (saved_menustate) back = true;
+			if (saved_menustate || !osd_unlocked) back = true;
 			break;
 		case KEY_ENTER:
 		case KEY_SPACE:
@@ -1183,6 +1212,30 @@ void HandleUI(void)
 			break;
 		case KEY_GRAVE:
 			recent = true;
+			break;
+		}
+	}
+
+	if (select_ini)
+	{
+		DISKLED_ON;
+
+		switch (c)
+		{
+		case KEY_ESC | UPSTROKE:
+			menu = true;
+			break;
+		case KEY_UP:
+			up = true;
+			break;
+		case KEY_DOWN:
+			down = true;
+			break;
+		case KEY_LEFT:
+			left = true;
+			break;
+		case KEY_RIGHT:
+			right = true;
 			break;
 		}
 	}
@@ -1225,37 +1278,38 @@ void HandleUI(void)
 	{
 		if (down)
 		{
-            if((menumask >= ((uint64_t)1 << (menusub + 1))))	// Any active entries left?
-            {
-			    do
-			    {
-				    menusub++;
-			    } while ((menumask & ((uint64_t)1 << menusub)) == 0);
-            }
-            else
-            {
-                menusub = 0; // jump to first item
-            }
+			if((menumask >= ((uint64_t)1 << (menusub + 1))))	// Any active entries left?
+			{
+				do
+				{
+					menusub++;
+				} while ((menumask & ((uint64_t)1 << menusub)) == 0);
+			} else {
+				menusub = 0; // jump to first item
+				while ((menumask & ((uint64_t)1 << menusub )) == 0) menusub++;
+			}
 
-            menustate = parentstate;
+			menustate = parentstate;
 		}
 
 		if (up)
 		{
-            if (menusub > 0)
-            {
-			    do
-			    {
-				    --menusub;
-			    } while ((menumask & ((uint64_t)1 << menusub)) == 0);
-            }
-            else
-            {
-                do
-                {
-                    menusub++;
-                } while ((menumask & ((uint64_t)(~0) << (menusub + 1))) != 0); // jump to last item
-            }
+			if (menusub > 0)
+			{
+				do
+				{
+					--menusub;
+				} while (menusub != 0 && (menumask & ((uint64_t)1 << menusub)) == 0);
+				if (menusub == 0 && (menumask & 1) == 0) { //If the first menu entry is disabled...
+					while ((menumask & ((uint64_t)(~0) << (menusub + 1))) != 0) menusub++;
+					//Go to to last item
+				}
+			} else {
+				do
+				{
+					menusub++;
+				} while ((menumask & ((uint64_t)(~0) << (menusub + 1))) != 0); // jump to last item
+			}
 			menustate = parentstate;
 		}
 	}
@@ -1294,6 +1348,28 @@ void HandleUI(void)
 		break;
 	}
 
+	if (osd_lock_timer == 0) osd_lock_timer = GetTimer(10 * 1000);
+
+	switch (menustate)
+	{
+	case MENU_NONE1:
+	case MENU_NONE2:
+	case MENU_INFO:
+		if (!cfg.osd_lock[0] || is_menu() || !mgl->done) osd_unlocked = 1;
+		else if (cfg.osd_lock_time && CheckTimer(osd_lock_timer)) osd_unlocked = 0;
+		break;
+
+	case MENU_UNLOCK1:
+	case MENU_UNLOCK2:
+	case MENU_UNLOCK3:
+		break;
+
+	default:
+		osd_unlocked = 1;
+		osd_lock_timer = GetTimer(cfg.osd_lock_time * 1000);
+		break;
+	}
+
 	// Switch to current menu screen
 	switch (menustate)
 	{
@@ -1314,7 +1390,12 @@ void HandleUI(void)
 		// fall through
 
 	case MENU_NONE2:
-		if (menu || (is_menu() && !video_fb_state()) || (menustate == MENU_NONE2 && !mgl->done && mgl->state == 1))
+		if (menu && !osd_unlocked)
+		{
+			menustate = MENU_UNLOCK1;
+			osd_code_entry[0] = 0;
+		}
+		else if (menu || (is_menu() && !video_fb_state()) || (menustate == MENU_NONE2 && !mgl->done && mgl->state == 1))
 		{
 			OsdSetSize(16);
 			menusub = 0;
@@ -1329,7 +1410,11 @@ void HandleUI(void)
 			else if (is_st()) menustate = MENU_ST_MAIN1;
 			else if (is_archie()) menustate = MENU_ARCHIE_MAIN1;
 			else {
-				if (is_menu())
+				if (select_ini)
+				{
+					menustate = MENU_SELECT_INI1;
+				}
+				else if (is_menu())
 				{
 					menusub = 6;
 					SelectFile("", 0, SCANO_CORES, MENU_CORE_FILE_SELECTED1, MENU_SYSTEM1);
@@ -1355,6 +1440,59 @@ void HandleUI(void)
 			if (!mgl->done) OsdDisable();
 			else OsdEnable(DISABLE_KEYBOARD);
 			if (mgl->state == 1) mgl->state = 2;
+		}
+		break;
+
+	case MENU_SELECT_INI1:
+		{
+			OsdSetTitle("Select INI");
+			int flag = 1;
+			for (int i = 1; i < 4; i++) if (FileExists(cfg_get_name(i))) flag |= 1 << i;
+			for(int i = 0; i<16; i++) OsdWrite(m++);
+			m = 4;
+			OsdWrite(m++, "  Use dpad/cursor to select");
+			m += 2;
+			sprintf(s, "            %s", cfg_get_label(0));
+			OsdWrite(m++, s);
+			m++;
+			strcpy(s, "      ");
+			if (!(flag & 2)) strcat(s, "\xb");
+			strcat(s, cfg_get_label(1));
+			if (!(flag & 2)) strcat(s, "\xb");
+			strcat(s, "        ");
+			if (!(flag & 8)) strcat(s, "\xb");
+			strcat(s, cfg_get_label(3));
+			if (!(flag & 8)) strcat(s, "\xb");
+			OsdWrite(m++, s);
+			m++;
+			strcpy(s, "            ");
+			if (!(flag & 4)) strcat(s, "\xb");
+			strcat(s, cfg_get_label(2));
+			if (!(flag & 4)) strcat(s, "\xb");
+			OsdWrite(m++, s);
+			m++;
+			parentstate = MENU_SELECT_INI1;
+			menustate = MENU_SELECT_INI2;
+		}
+		break;
+
+	case MENU_SELECT_INI2:
+		if (menu || up)
+		{
+			menustate = MENU_NONE1;
+			select_ini = 0;
+		}
+		else if (left && FileExists(cfg_get_name(1)))
+		{
+			user_io_set_ini(1);
+		}
+		else if (down && FileExists(cfg_get_name(2)))
+		{
+			user_io_set_ini(2);
+		}
+		else if (right && FileExists(cfg_get_name(3)))
+		{
+			user_io_set_ini(3);
 		}
 		break;
 
@@ -1564,7 +1702,6 @@ void HandleUI(void)
 			OsdSetTitle(page ? title : user_io_get_core_name());
 
 			dip_submenu = -1;
-			dip2_submenu = -1;
 
 			int last_space = 0;
 
@@ -1587,23 +1724,10 @@ void HandleUI(void)
 					else if (!strcmp(p, "DIP"))
 					{
 						h = page;
-						if (!h && arcade_sw(0)->dip_num)
+						if (!h && arcade_sw()->dip_num)
 						{
 							dip_submenu = selentry;
 							MenuWrite(entry, " DIP Switches              \x16", menusub == selentry, 0);
-							entry++;
-							selentry++;
-							menumask = (menumask << 1) | 1;
-						}
-						continue;
-					}
-					else if (!strcmp(p, "CHEAT"))
-					{
-						h = page;
-						if (!h && arcade_sw(1)->dip_num)
-						{
-							dip2_submenu = selentry;
-							MenuWrite(entry, " Cheats                    \x16", menusub == selentry, 0);
 							entry++;
 							selentry++;
 							menumask = (menumask << 1) | 1;
@@ -1900,7 +2024,12 @@ void HandleUI(void)
 	case MENU_GENERIC_SAVE_WAIT:
 		menumask = 0;
 		parentstate = menustate;
-		if (menu_save_timer && CheckTimer(menu_save_timer))
+		if (menu)
+		{
+			menu_save_timer = 0;
+			menustate = MENU_NONE1;
+		}
+		else if (menu_save_timer && CheckTimer(menu_save_timer))
 		{
 			menu_save_timer = 0;
 			menustate = MENU_GENERIC_MAIN1;
@@ -1951,9 +2080,8 @@ void HandleUI(void)
 				select = 1;
 			}
 
-			if ((dip_submenu == menusub || dip2_submenu == menusub) && select)
+			if (dip_submenu == menusub && select)
 			{
-				dipv = (dip_submenu == menusub) ? 0 : 1;
 				menustate = MENU_ARCADE_DIP1;
 				menusub = 0;
 			}
@@ -1976,8 +2104,7 @@ void HandleUI(void)
 					d = 0;
 					inpage = !page;
 
-					if (!strcmp(p, "DIP")) h = page || !arcade_sw(0)->dip_num;
-					else if (!strcmp(p, "CHEAT")) h = page || !arcade_sw(1)->dip_num;
+					if (!strcmp(p, "DIP")) h = page || !arcade_sw()->dip_num;
 					else if (strncmp(p, "DEFMRA,", 7))
 					{
 						//Hide or Disable flag
@@ -2089,11 +2216,14 @@ void HandleUI(void)
 						if (is_x86() || is_pcxt()) strcpy(Selected_tmp, x86_get_image_path(ioctl_index));
 						if (is_psx() && (ioctl_index == 2 || ioctl_index == 3)) fs_Options |= SCANO_SAVES;
 
-						if (is_pce() || is_megacd() || is_x86() || (is_psx() && !(fs_Options & SCANO_SAVES)))
+						if (is_saturn() || is_pce() || is_megacd() || is_x86() || is_cdi() || (is_psx() && !(fs_Options & SCANO_SAVES)) || is_neogeo())
 						{
 							//look for CHD too
-							strcat(fs_pFileExt, "CHD");
-							strcat(ext, "CHD");
+							if (!strcasestr(ext, "CHD"))
+							{
+								strcat(fs_pFileExt, "CHD");
+								strcat(ext, "CHD");
+							}
 
 							int num = ScanDirectory(Selected_tmp, SCANF_INIT, fs_pFileExt, 0);
 							memcpy(Selected_tmp, Selected_S[(int)ioctl_index], sizeof(Selected_tmp));
@@ -2193,6 +2323,12 @@ void HandleUI(void)
 								}
 								else
 								{
+									if (!bit && is_uneon())
+									{
+										x86_ide_set();
+										menustate = MENU_NONE1;
+									}
+
 									if (is_megacd())
 									{
 										if (!bit) mcd_set_image(0, "");
@@ -2205,6 +2341,7 @@ void HandleUI(void)
 
 									if (is_pce() && !bit) pcecd_reset();
 									if (is_saturn() && !bit) saturn_reset();
+									if (is_n64() && !bit) n64_reset();
 
 									user_io_status_set(opt, 1, ex);
 									user_io_status_set(opt, 0, ex);
@@ -2244,7 +2381,11 @@ void HandleUI(void)
 
 	case MENU_GENERIC_FILE_SELECTED:
 		{
-			if (!mgl->done) snprintf(selPath, sizeof(selPath), "%s/%s", HomeDir(), mgl->item[mgl->current].path);
+			if (!mgl->done)
+			{
+				if(mgl->item[mgl->current].path[0] == '/') snprintf(selPath, sizeof(selPath), "%s", mgl->item[mgl->current].path);
+				else snprintf(selPath, sizeof(selPath), "%s/%s", HomeDir(), mgl->item[mgl->current].path);
+			}
 
 			MenuHide();
 			printf("File selected: %s\n", selPath);
@@ -2268,7 +2409,7 @@ void HandleUI(void)
 				if (fs_Options & SCANO_NEOGEO)
 				{
 					neocd_set_en(0);
-					neogeo_romset_tx(selPath);
+					neogeo_romset_tx(selPath, 0);
 				}
 				else
 				{
@@ -2278,8 +2419,17 @@ void HandleUI(void)
 						pcecd_reset();
 					}
 					if (!store_name) user_io_store_filename(selPath);
-					user_io_file_tx(selPath, idx, opensave, 0, 0, load_addr);
-					if (user_io_use_cheats() && !store_name) cheats_init(selPath, user_io_get_file_crc());
+					if (is_n64())
+					{
+						uint32_t n64_crc;
+						if (!n64_rom_tx(selPath, idx, load_addr, n64_crc)) Info("failed to load ROM");
+						else if (user_io_use_cheats() && !store_name) cheats_init(selPath, n64_crc);
+					}
+					else
+					{
+						user_io_file_tx(selPath, idx, opensave, 0, 0, load_addr);
+						if (user_io_use_cheats() && !store_name) cheats_init(selPath, user_io_get_file_crc());
+					}
 				}
 
 				if (addon[0] == 'f' && addon[1] == '1') process_addon(addon, idx);
@@ -2291,7 +2441,11 @@ void HandleUI(void)
 
 	case MENU_GENERIC_IMAGE_SELECTED:
 		{
-			if (!mgl->done) snprintf(selPath, sizeof(selPath), "%s/%s", HomeDir(((is_pce() && !strncasecmp(fs_pFileExt, "CUE", 3)) ? PCECD_DIR : NULL)), mgl->item[mgl->current].path);
+			if (!mgl->done)
+			{
+				if (mgl->item[mgl->current].path[0] == '/') snprintf(selPath, sizeof(selPath), "%s", mgl->item[mgl->current].path);
+				else snprintf(selPath, sizeof(selPath), "%s/%s", HomeDir(((is_pce() && !strncasecmp(fs_pFileExt, "CUE", 3)) ? PCECD_DIR : NULL)), mgl->item[mgl->current].path);
+			}
 
 			if (store_name)
 			{
@@ -2310,7 +2464,7 @@ void HandleUI(void)
 			char idx = user_io_ext_idx(selPath, fs_pFileExt) << 6 | ioctl_index;
 			if (addon[0] == 'f' && addon[1] != '1') process_addon(addon, idx);
 
-			else if (is_x86() || is_pcxt())
+			else if (is_x86() || is_pcxt() || (is_uneon() && idx >= 2))
 			{
 				x86_set_image(ioctl_index, selPath);
 			}
@@ -2327,6 +2481,10 @@ void HandleUI(void)
 			{
 				psx_mount_cd(user_io_ext_idx(selPath, fs_pFileExt) << 6 | (menusub + 1), ioctl_index, selPath);
 				cheats_init(selPath, 0);
+			}
+			else if (is_cdi())
+			{
+				cdi_mount_cd(ioctl_index, selPath);
 			}
 			else if (is_saturn())
 			{
@@ -2364,23 +2522,31 @@ void HandleUI(void)
 			while(1)
 			{
 				n = 0;
-				menumask = 0x7802f;
+				menumask = 0x7805d;
 
 				if (!menusub) firstmenu = 0;
 				adjvisible = 0;
 
 				MenuWrite(n++, " Core                      \x16", menusub == 0, 0);
 				MenuWrite(n++);
+
+				if (cfg.osd_lock[0] && !cfg.osd_lock_time)
+				{
+					MenuWrite(n++, " Lock OSD", menusub == 1, 0);
+					MenuWrite(n++);
+					menumask |= 2;
+				}
+
 				sprintf(s, " Define %s buttons         ", is_menu() ? "System" : user_io_get_core_name());
 				s[27] = '\x16';
 				s[28] = 0;
-				MenuWrite(n++, s, menusub == 1, 0);
-				MenuWrite(n++, " Button/Key remap for game \x16", menusub == 2, 0);
-				MenuWrite(n++, " Reset player assignment", menusub == 3, 0);
+				MenuWrite(n++, s, menusub == 2, 0);
+				MenuWrite(n++, " Button/Key remap          \x16", menusub == 3, 0);
+				MenuWrite(n++, " Reset player assignment", menusub == 4, 0);
 
 				if (user_io_get_uart_mode())
 				{
-					menumask |= 0x10;
+					menumask |= 0x20;
 					MenuWrite(n++);
 					int mode = GetUARTMode();
 					const char *p = config_uart_msg[mode];
@@ -2388,11 +2554,11 @@ void HandleUI(void)
 					sprintf(s, " UART mode (%s)            ",p);
 					s[27] = '\x16';
 					s[28] = 0;
-					MenuWrite(n++, s, menusub == 4);
+					MenuWrite(n++, s, menusub == 5);
 				}
 
 				MenuWrite(n++);
-				MenuWrite(n++, " Video processing          \x16", menusub==5);
+				MenuWrite(n++, " Video processing          \x16", menusub==6);
 
 				if (audio_filter_en() >= 0)
 				{
@@ -2474,6 +2640,11 @@ void HandleUI(void)
 				break;
 
 			case 1:
+				osd_unlocked = 0;
+				menustate = MENU_NONE1;
+				break;
+
+			case 2:
 				if (is_minimig())
 				{
 					joy_bcount = 7;
@@ -2495,25 +2666,25 @@ void HandleUI(void)
 				joymap_first = 1;
 				break;
 
-			case 2:
+			case 3:
 				start_map_setting(-1);
 				menustate = MENU_JOYKBDMAP;
 				menusub = 0;
 				break;
 
-			case 3:
+			case 4:
 				reset_players();
 				menustate = MENU_NONE1;
 				break;
 
-			case 4:
+			case 5:
 				{
 					menustate = MENU_UART1;
 					menusub = 0;
 				}
 				break;
 
-			case 5:
+			case 6:
 				{
 					menustate = MENU_VIDEOPROC1;
 					menusub = 0;
@@ -2649,7 +2820,7 @@ void HandleUI(void)
 
 	case MENU_VIDEOPROC1:
 		helptext_idx = 0;
-		menumask = 0x1FFF;
+		menumask = 0x7FFF;
 		OsdSetTitle("Video Processing");
 		menustate = MENU_VIDEOPROC2;
 		parentstate = MENU_VIDEOPROC1;
@@ -2672,6 +2843,7 @@ void HandleUI(void)
 			strcat(s, " \x16 ");
 			MenuWrite(n++, s, menusub == 2, !video_get_scaler_flt(VFILTER_HORZ) || !S_ISDIR(getFileType(COEFF_DIR)));
 
+      
 			MenuWrite(n++);
 			sprintf(s, " Vert filter: %s", video_get_scaler_flt(VFILTER_VERT) ? "From file" : "Same as Horz");
 			MenuWrite(n++, s, menusub == 3, cfg.direct_video || !video_get_scaler_flt(VFILTER_HORZ));
@@ -2693,30 +2865,41 @@ void HandleUI(void)
 			MenuWrite(n++, s, menusub == 6, !video_get_scaler_flt(VFILTER_SCAN) || !video_get_scaler_flt(VFILTER_HORZ) || !S_ISDIR(getFileType(COEFF_DIR)) || cfg.direct_video);
 
 			MenuWrite(n++);
+			sprintf(s, " Intl filter: %s", video_get_scaler_flt(VFILTER_ILACE) ? "From file" : "Same as Horz");
+			MenuWrite(n++, s, menusub == 7, cfg.direct_video || !video_get_scaler_flt(VFILTER_HORZ));
+			strcpy(s, " ");
+			if (strlen(video_get_scaler_coeff(VFILTER_ILACE))) strncat(s, video_get_scaler_coeff(VFILTER_ILACE), 25);
+			else strcpy(s, " < none >");
+			while (strlen(s) < 26) strcat(s, " ");
+			strcat(s, " \x16 ");
+			MenuWrite(n++, s, menusub == 8, !video_get_scaler_flt(VFILTER_ILACE) || !video_get_scaler_flt(VFILTER_HORZ) || !S_ISDIR(getFileType(COEFF_DIR)) || cfg.direct_video);
+
+
+			MenuWrite(n++);
 			sprintf(s, " Gamma correction - %s", (video_get_gamma_en() > 0) ? "On" : "Off");
-			MenuWrite(n++, s, menusub == 7, video_get_gamma_en() < 0);
+			MenuWrite(n++, s, menusub == 9, video_get_gamma_en() < 0);
 			strcpy(s, " ");
 			if (strlen(video_get_gamma_curve())) strncat(s, video_get_gamma_curve(), 25);
 			else strcpy(s, " < none >");
 			while (strlen(s) < 26) strcat(s, " ");
 			strcat(s, " \x16 ");
-			MenuWrite(n++, s, menusub == 8, (video_get_gamma_en() <= 0) || !S_ISDIR(getFileType(GAMMA_DIR)));
+			MenuWrite(n++, s, menusub == 10, (video_get_gamma_en() <= 0) || !S_ISDIR(getFileType(GAMMA_DIR)));
 
 			MenuWrite(n++);
 			sprintf(s, " Shadow Mask - %s", (video_get_shadow_mask_mode() < 0) ? config_smask_msg[0] : config_smask_msg[video_get_shadow_mask_mode()]);
-			MenuWrite(n++, s, menusub == 9, video_get_shadow_mask_mode() < 0);
+			MenuWrite(n++, s, menusub == 11, video_get_shadow_mask_mode() < 0);
 			strcpy(s, " ");
 			if (strlen(video_get_shadow_mask())) strncat(s, video_get_shadow_mask(), 25);
 			else strcpy(s, " < none >");
 			while (strlen(s) < 26) strcat(s, " ");
 			strcat(s, " \x16 ");
-			MenuWrite(n++, s, menusub == 10, (video_get_shadow_mask_mode() <= 0) || !S_ISDIR(getFileType(SMASK_DIR)));
+			MenuWrite(n++, s, menusub == 12, (video_get_shadow_mask_mode() <= 0) || !S_ISDIR(getFileType(SMASK_DIR)));
 
 			MenuWrite(n++);
-			MenuWrite(n++, " Reset to Defaults", menusub == 11);
+			MenuWrite(n++, " Reset to Defaults", menusub == 13);
 
 			MenuWrite(n++);
-			MenuWrite(n++, STD_BACK, menusub == 12);
+			MenuWrite(n++, STD_BACK, menusub == 14);
 
 			if (!adjvisible) break;
 			firstmenu += adjvisible;
@@ -2726,7 +2909,7 @@ void HandleUI(void)
 	case MENU_VIDEOPROC2:
 		if (menu || left)
 		{
-			menusub = 5;
+			menusub = 8;
 			menustate = MENU_COMMON1;
 			break;
 		}
@@ -2755,7 +2938,8 @@ void HandleUI(void)
 			case 2:
 			case 4:
 			case 6:
-				vfilter_type = (menusub == 2) ? VFILTER_HORZ : (menusub == 4) ? VFILTER_VERT : VFILTER_SCAN;
+			case 8:
+				vfilter_type = (menusub == 2) ? VFILTER_HORZ : (menusub == 4) ? VFILTER_VERT : (menusub == 6) ? VFILTER_SCAN : VFILTER_ILACE;
 				if(video_get_scaler_flt(VFILTER_HORZ) && video_get_scaler_flt(vfilter_type))
 				{
 					const char *newfile = flist_GetPrevNext(COEFF_DIR, video_get_scaler_coeff(vfilter_type, 0), "TXT", plus);
@@ -2763,7 +2947,7 @@ void HandleUI(void)
 				}
 				break;
 
-			case 8:
+			case 10:
 				if(video_get_gamma_en() > 0)
 				{
 					const char *newfile = flist_GetPrevNext(GAMMA_DIR, video_get_gamma_curve(0), "TXT", plus);
@@ -2771,7 +2955,7 @@ void HandleUI(void)
 				}
 				break;
 
-			case 10:
+			case 12:
 				if (video_get_shadow_mask_mode() > 0)
 				{
 					const char *newfile = flist_GetPrevNext(SMASK_DIR, video_get_shadow_mask(0), "TXT", plus);
@@ -2799,7 +2983,8 @@ void HandleUI(void)
 			case 2:
 			case 4:
 			case 6:
-				vfilter_type = (menusub == 2) ? VFILTER_HORZ : (menusub == 4) ? VFILTER_VERT : VFILTER_SCAN;
+			case 8:
+				vfilter_type = (menusub == 2) ? VFILTER_HORZ : (menusub == 4) ? VFILTER_VERT : (menusub == 6) ? VFILTER_SCAN : VFILTER_ILACE;
 				if (video_get_scaler_flt(VFILTER_HORZ))
 				{
 					snprintf(Selected_tmp, sizeof(Selected_tmp), COEFF_DIR"/%s", video_get_scaler_coeff(vfilter_type, 0));
@@ -2809,27 +2994,22 @@ void HandleUI(void)
 				break;
 
 			case 3:
-				if (!cfg.direct_video && video_get_scaler_flt(VFILTER_HORZ))
-				{
-					video_set_scaler_flt(VFILTER_VERT, video_get_scaler_flt(VFILTER_VERT) ? 0 : 1);
-					menustate = parentstate;
-				}
-				break;
-
 			case 5:
+			case 7:
 				if (!cfg.direct_video && video_get_scaler_flt(VFILTER_HORZ))
 				{
-					video_set_scaler_flt(VFILTER_SCAN, video_get_scaler_flt(VFILTER_SCAN) ? 0 : 1);
+					vfilter_type = (menusub == 3) ? VFILTER_VERT : (menusub == 5) ? VFILTER_SCAN : VFILTER_ILACE;
+					video_set_scaler_flt(vfilter_type, video_get_scaler_flt(vfilter_type) ? 0 : 1);
 					menustate = parentstate;
 				}
 				break;
 
-			case 7:
+			case 9:
 				if (video_get_gamma_en() >= 0) video_set_gamma_en(video_get_gamma_en() ? 0 : 1);
 				menustate = parentstate;
 				break;
 
-			case 8:
+			case 10:
 				if (video_get_gamma_en() > 0)
 				{
 					snprintf(Selected_tmp, sizeof(Selected_tmp), GAMMA_DIR"/%s", video_get_gamma_curve(0));
@@ -2838,12 +3018,12 @@ void HandleUI(void)
 				}
 				break;
 
-			case 9:
+			case 11:
 				if (video_get_shadow_mask_mode() >= 0) video_set_shadow_mask_mode(video_get_shadow_mask_mode() + 1);
 				menustate = parentstate;
 				break;
 
-			case 10:
+			case 12:
 				if (video_get_shadow_mask_mode() > 0)
 				{
 					snprintf(Selected_tmp, sizeof(Selected_tmp), SMASK_DIR"/%s", video_get_shadow_mask(0));
@@ -2852,13 +3032,13 @@ void HandleUI(void)
 				}
 				break;
 
-			case 11:
+			case 13:
 				video_cfg_reset();
 				menustate = parentstate;
 				break;
 
-			case 12:
-				menusub = 5;
+			case 14:
+				menusub = 6;
 				menustate = MENU_COMMON1;
 				break;
 			}
@@ -2928,7 +3108,7 @@ void HandleUI(void)
 	case MENU_ARCADE_DIP1:
 		helptext_idx = 0;
 		menumask = 0;
-		OsdSetTitle(dipv ? "Cheats" : "DIP Switches");
+		OsdSetTitle("DIP Switches");
 		menustate = MENU_ARCADE_DIP2;
 		parentstate = MENU_ARCADE_DIP1;
 
@@ -2941,7 +3121,7 @@ void HandleUI(void)
 			uint32_t selentry = 0;
 			menumask = 0;
 
-			sw_struct *sw = arcade_sw(dipv);
+			sw_struct *sw = arcade_sw();
 
 			int n = (sw->dip_num < OsdGetSize() - 1) ? (OsdGetSize() - 1 - sw->dip_num) / 2 : 0;
 			for (; entry < n; entry++) MenuWrite(entry);
@@ -2982,7 +3162,7 @@ void HandleUI(void)
 
 			for (; entry < OsdGetSize() - 1; entry++) MenuWrite(entry, "", 0, 0);
 
-			MenuWrite(entry, dipv ? STD_BACK : "       Reset to apply", menusub == selentry);
+			MenuWrite(entry, "       Reset to apply", menusub == selentry);
 			menusub_last = selentry;
 			menumask = (menumask << 1) | 1;
 
@@ -2995,30 +3175,22 @@ void HandleUI(void)
 		if (menu || left)
 		{
 			menustate = MENU_GENERIC_MAIN1;
-			menusub = dipv ? dip2_submenu : dip_submenu;
-			arcade_sw_save(0);
+			menusub = dip_submenu;
+			arcade_sw_save();
 		}
 
 		if (select)
 		{
 			if (menusub == menusub_last)
 			{
-				if (!dipv)
-				{
-					arcade_sw_save(dipv);
-					user_io_status_set("[0]", 1);
-					user_io_status_set("[0]", 0);
-					menustate = MENU_NONE1;
-				}
-				else
-				{
-					menusub = dip2_submenu;
-					menustate = MENU_GENERIC_MAIN1;
-				}
+				arcade_sw_save();
+				user_io_status_set("[0]", 1);
+				user_io_status_set("[0]", 0);
+				menustate = MENU_NONE1;
 			}
 			else
 			{
-				sw_struct *sw = arcade_sw(dipv);
+				sw_struct *sw = arcade_sw();
 				uint64_t status = sw->dip_cur & sw->dip[menusub].mask;
 				int m = 0;
 				for (int n = 0; n < sw->dip[menusub].num; n++)
@@ -3033,7 +3205,7 @@ void HandleUI(void)
 				m = (m + 1) % sw->dip[menusub].num;
 				sw->dip_cur = (sw->dip_cur & ~sw->dip[menusub].mask) | sw->dip[menusub].val[m];
 				menustate = MENU_ARCADE_DIP1;
-				arcade_sw_send(dipv);
+				arcade_sw_send();
 			}
 		}
 		break;
@@ -3106,7 +3278,7 @@ void HandleUI(void)
 		if (menu || left)
 		{
 			menustate = MENU_COMMON1;
-			menusub = 4;
+			menusub = 5;
 			break;
 		}
 
@@ -3205,7 +3377,7 @@ void HandleUI(void)
 				{
 					ResetUART();
 					menustate = MENU_COMMON1;
-					menusub = 4;
+					menusub = 5;
 				}
 				break;
 
@@ -3222,7 +3394,7 @@ void HandleUI(void)
 					sprintf(s, "uartspeed.%s", user_io_get_core_name());
 					FileSaveConfig(s, speeds, sizeof(speeds));
 					menustate = MENU_COMMON1;
-					menusub = 4;
+					menusub = 5;
 				}
 				break;
 
@@ -3488,9 +3660,9 @@ void HandleUI(void)
 		}
 		OsdWrite(12, s, menusub == 1);
 
-		m = get_volume();
+		old_volume = get_volume();
 		strcpy(s, "   Global Volume: ");
-		if (m & 0x10)
+		if (old_volume & 0x10)
 		{
 			strcat(s, "< Mute >");
 		}
@@ -3500,7 +3672,7 @@ void HandleUI(void)
 			char *bar = s + strlen(s);
 			int vol = (audio_filter_en() < 0) ? get_core_volume() : 0;
 			memset(bar, 0x8C, 8 - vol);
-			memset(bar, 0x7f, 8 - vol - m);
+			memset(bar, 0x7f, 8 - vol - old_volume);
 		}
 		OsdWrite(13, s, menusub == 2);
 
@@ -3581,6 +3753,13 @@ void HandleUI(void)
 				break;
 			}
 		}
+
+		m = get_volume();
+		if (old_volume != m)
+		{
+			old_volume = m;
+			menustate = MENU_MISC1;
+		}
 		break;
 
 	case MENU_JOYRESET:
@@ -3626,7 +3805,7 @@ void HandleUI(void)
 			if (get_map_clear())
 			{
 				OsdWrite(3);
-				OsdWrite(4, "           Clearing");
+				OsdWrite(4, "          Clearing");
 				OsdWrite(5);
 				joymap_first = 1;
 				break;
@@ -3635,7 +3814,7 @@ void HandleUI(void)
 			if (get_map_cancel())
 			{
 				OsdWrite(3);
-				OsdWrite(4, "           Canceling");
+				OsdWrite(4, "          Canceling");
 				OsdWrite(5);
 				break;
 			}
@@ -3794,7 +3973,7 @@ void HandleUI(void)
 				else
 				{
 					menustate = MENU_COMMON1;
-					menusub = 1;
+					menusub = 2;
 				}
 			}
 		}
@@ -3804,7 +3983,7 @@ void HandleUI(void)
 		if (select || menu)
 		{
 			menustate = MENU_COMMON1;
-			menusub = 1;
+			menusub = 2;
 		}
 		break;
 
@@ -3824,7 +4003,7 @@ void HandleUI(void)
 		if (menu)
 		{
 			menustate = MENU_COMMON1;
-			menusub = 1;
+			menusub = 2;
 			break;
 		}
 		else if (select)
@@ -3833,7 +4012,7 @@ void HandleUI(void)
 			{
 			case 0:
 				menustate = MENU_COMMON1;
-				menusub = 1;
+				menusub = 2;
 				break;
 
 			case 1:
@@ -3861,8 +4040,8 @@ void HandleUI(void)
 		infowrite( 9, "Button -> Button same pad");
 		infowrite(10, "Key -> Key");
 		infowrite(11, "");
-		infowrite(12, "It will be cleared when you");
-		infowrite(13, "load the new core");
+		infowrite(12, "     Menu \x16 Finish ");
+		infowrite(13, "Menu-hold \x16 Clear  ");
 		OsdWrite(14, info_bottom, 0, 0);
 		OsdWrite(OsdGetSize() - 1, "           Cancel", menusub == 0, 0);
 		break;
@@ -3896,11 +4075,24 @@ void HandleUI(void)
 			OsdWrite(OsdGetSize() - 1);
 		}
 
-		if (select || menu)
+		if (select || menu || get_map_finish() || get_map_cancel())
 		{
-			finish_map_setting(menu);
+			int clear = get_map_vid() && (menu || get_map_cancel());
+			finish_map_setting(clear);
+			menu_timeout = GetTimer(1000);
+			OsdWrite(1);
+			OsdWrite(2, clear ? "          Clearing" : "          Finishing");
+			OsdWrite(3);
+			OsdWrite(OsdGetSize() - 1);
+			menustate = MENU_JOYKBDMAP2;
+		}
+		break;
+
+	case MENU_JOYKBDMAP2:
+		if (CheckTimer(menu_timeout))
+		{
 			menustate = MENU_COMMON1;
-			menusub = 2;
+			menusub = 3;
 		}
 		break;
 
@@ -3947,6 +4139,76 @@ void HandleUI(void)
 		}
 		break;
 
+	case MENU_UNLOCK1:
+		OsdSetSize(8);
+		menumask = 0;
+		helptext_idx = 0;
+		menustate = MENU_UNLOCK2;
+		parentstate = MENU_UNLOCK1;
+		OsdEnable(DISABLE_KEYBOARD);
+		OsdSetTitle("Locked", 0);
+		for (int r = 0; r < OsdGetSize(); r++) OsdWrite(r);
+		{
+			if (strlen(osd_code_entry) >= strlen(cfg.osd_lock))
+			{
+				lock_pass_timeout = GetTimer(200);
+				menustate = MENU_UNLOCK3;
+			}
+
+			int maxlen = strlen(cfg.osd_lock);
+			int count = strlen(osd_code_entry);
+
+			m = 2;
+			OsdWrite(m++, "      Enter unlock code", 0, 0, 1);
+			OsdWrite(m++, "", 0, 0, 1);
+			OsdWrite(m++, "", 0, 0, 1);
+
+			int i;
+			for (i = 0; i < (29 - maxlen) / 2; i++) s[i] = ' ';
+			for (int j = 0; j < maxlen; j++, i++) s[i] = j < count ? 0x7F : 0x8C;
+
+			s[i] = '\0';
+			OsdWrite(m++, s, 0, 0, 1);
+			OsdUpdate();
+		}
+		break;
+
+	case MENU_UNLOCK2:
+		{
+			const char *append = "";
+			if (up) append = "U";
+			else if (down) append = "D";
+			else if (left) append = "L";
+			else if (right) append = "R";
+			else if (select) append = "A";
+			else if (back) append = "B";
+			else if (menu) menustate = MENU_NONE1;
+
+			if (append[0])
+			{
+				strcat(osd_code_entry, append);
+				menustate = MENU_UNLOCK1;
+			}
+		}
+		break;
+
+	case MENU_UNLOCK3:
+		if (CheckTimer(lock_pass_timeout))
+		{
+			if (!strcmp(osd_code_entry, cfg.osd_lock))
+			{
+				osd_unlocked = 1;
+				osd_lock_timer = GetTimer(cfg.osd_lock_time * 1000);
+				menustate = MENU_NONE2;
+				menu_key_set(KEY_F12);
+			}
+			else
+			{
+				menustate = MENU_UNLOCK1;
+				osd_code_entry[0] = 0;
+			}
+		}
+		break;
 
 		/******************************************************************/
 		/* st main menu                                                 */
@@ -4864,7 +5126,7 @@ void HandleUI(void)
 				char type = flist_SelectedItem()->de.d_type;
 				memcpy(name, flist_SelectedItem()->de.d_name, sizeof(name));
 
-				if ((fs_Options & SCANO_UMOUNT) && (is_megacd() || is_pce() || (is_psx() && !(fs_Options & SCANO_SAVES)) || is_saturn()) && type == DT_DIR && strcmp(flist_SelectedItem()->de.d_name, ".."))
+				if ((fs_Options & SCANO_UMOUNT) && (is_megacd() || is_pce() || is_cdi() || is_neogeo() || (is_psx() && !(fs_Options & SCANO_SAVES)) || is_saturn()) && type == DT_DIR && strcmp(flist_SelectedItem()->de.d_name, ".."))
 				{
 					int len = strlen(selPath);
 					strcat(selPath, "/");
@@ -5138,16 +5400,13 @@ void HandleUI(void)
 				printf("Saving config to %s\n", filename);
 				user_io_status_save(filename);
 				menustate = MENU_GENERIC_MAIN1;
-				for (int n = 0; n < 2; n++)
+				if (arcade_sw()->dip_num)
 				{
-					if (arcade_sw(n)->dip_num)
-					{
-						arcade_sw(n)->dip_cur = arcade_sw(n)->dip_def;
-						arcade_sw_send(n);
-						user_io_status_set("[0]", 1);
-						user_io_status_set("[0]", 0);
-						arcade_sw_save(n);
-					}
+					arcade_sw()->dip_cur = arcade_sw()->dip_def;
+					arcade_sw_send();
+					user_io_status_set("[0]", 1);
+					user_io_status_set("[0]", 0);
+					arcade_sw_save();
 				}
 				menustate = MENU_NONE1;
 				menusub = 0;
@@ -5572,7 +5831,7 @@ void HandleUI(void)
 		OsdWrite(m++, "", 0, 0);
 		strcpy(s, " ROM    : ");
 		{
-			char *path = user_io_get_core_path();
+			char *path = HomeDir();
 			int len = strlen(path);
 			char *name = minimig_config.kickstart;
 			if (!strncasecmp(name, path, len))  name += len + 1;
@@ -5597,24 +5856,20 @@ void HandleUI(void)
 		{
 			if (menusub == 0)
 			{
+				int cpu = minimig_config.cpu & 3;
+				if (minus)
+				{
+					cpu = (cpu == 0) ? 3 : (cpu == 3) ? 1 : 0;
+				}
+				else
+				{
+					cpu = (cpu == 0) ? 1 : (cpu == 1) ? 3 : 0;
+				}
+
 				menustate = MENU_MINIMIG_CHIPSET1;
-				minimig_config.cpu = (minimig_config.cpu & 0xfc) | ((minimig_config.cpu & 1) ? 0 : 3);
+				minimig_config.cpu = (minimig_config.cpu & 0xfc) | cpu;
 				minimig_ConfigCPU(minimig_config.cpu);
 			}
-			/*
-			else if (menusub == 1 && (minimig_config.cpu & 0x2))
-			{
-				menustate = MENU_MINIMIG_CHIPSET1;
-				minimig_config.cpu ^= 4;
-				minimig_ConfigCPU(minimig_config.cpu);
-			}
-			else if (menusub == 2 && (minimig_config.cpu & 0x2))
-			{
-				menustate = MENU_MINIMIG_CHIPSET1;
-				minimig_config.cpu ^= 8;
-				minimig_ConfigCPU(minimig_config.cpu);
-			}
-			*/
 			else if (menusub == 1 && (minimig_config.cpu & 0x2))
 			{
 				menustate = MENU_MINIMIG_CHIPSET1;
@@ -5772,7 +6027,7 @@ void HandleUI(void)
 				if (minimig_config.hardfile[i].filename[0])
 				{
 					strcpy(s, "                                ");
-					char *path = user_io_get_core_path();
+					char *path = HomeDir();
 					int len = strlen(path);
 					char *name = minimig_config.hardfile[i].filename;
 					if (!strncasecmp(name, path, len))  name += len + 1;
@@ -5891,8 +6146,7 @@ void HandleUI(void)
 
 			if (ide_is_placeholder(num))
 			{
-				if (ide_check() & 0x8000) ide_open(num, minimig_config.hardfile[num].filename);
-				else OpenHardfile(num, minimig_config.hardfile[num].filename);
+				ide_open(num, minimig_config.hardfile[num].filename);
 			}
 
 			menustate = MENU_MINIMIG_DISK1;
@@ -6534,16 +6788,21 @@ void HandleUI(void)
 		menustate = MENU_KBDMAP1;
 		parentstate = MENU_KBDMAP;
 		for (int i = 0; i < OsdGetSize() - 1; i++) OsdWrite(i, "", 0, 0);
-		OsdWrite(OsdGetSize() - 1, "           cancel", menusub == 0, 0);
-		flag = 0;
+		m = 8;
+		OsdWrite(m++, info_top, 0, 0);
+		infowrite(m++, "");
+		infowrite(m++, "Enter \x16 Finish");
+		infowrite(m++, " ESC \x16 Clear");
+		infowrite(m++, "");
+		OsdWrite(m++, info_bottom, 0, 0);
 		break;
 
 	case MENU_KBDMAP1:
 		if(!get_map_button())
 		{
-			OsdWrite(3, "     Press key to remap", 0, 0);
+			OsdWrite(3, "     Press key to change", 0, 0);
 			s[0] = 0;
-			if(flag)
+			if(get_map_vid())
 			{
 				sprintf(s, "    on keyboard %04x:%04x", get_map_vid(), get_map_pid());
 			}
@@ -6552,7 +6811,6 @@ void HandleUI(void)
 		}
 		else
 		{
-			flag = 1;
 			sprintf(s, "  Press key to map 0x%02X to", get_map_button() & 0xFF);
 			OsdWrite(3, s, 0, 0);
 			OsdWrite(5, "      on any keyboard", 0, 0);
@@ -6561,7 +6819,20 @@ void HandleUI(void)
 
 		if (select || menu)
 		{
+			if (!get_map_vid()) menu = 0;
+
+			OsdWrite(3);
+			OsdWrite(4, menu ? "          Clearing" : "          Finishing");
+			OsdWrite(5);
 			finish_map_setting(menu);
+			menu_timeout = GetTimer(1000);
+			menustate = MENU_KBDMAP2;
+		}
+		break;
+
+	case MENU_KBDMAP2:
+		if (CheckTimer(menu_timeout))
+		{
 			menustate = MENU_SYSTEM1;
 			menusub = 1;
 		}
@@ -6823,6 +7094,10 @@ void PrintDirectory(int expand)
 			{
 				strncpy(s + 1, flist_DirItem(k)->altname+1, len-1);
 			}
+			else if (flist_DirItem(k)->flags & DT_EXT_ZIP)
+			{
+				strncpy(s + 1, flist_DirItem(k)->altname, len-4); // strip .zip extension, see below
+			}
 			else
 			{
 				strncpy(s + 1, flist_DirItem(k)->altname, len); // display only name
@@ -6837,7 +7112,10 @@ void PrintDirectory(int expand)
 				}
 				else
 				{
-					strcpy(&s[22], " <DIR>");
+					if (flist_DirItem(k)->flags & DT_EXT_ZIP) // mark ZIP archive with different suffix
+						strcpy(&s[22], " <ZIP>");
+					else
+						strcpy(&s[22], " <DIR>");
 				}
 				len2 = 0;
 			}
@@ -6950,6 +7228,11 @@ void MenuHide()
 	HandleUI();
 }
 
+int menu_present()
+{
+	return (menustate != MENU_NONE1) && (menustate != MENU_NONE2);
+}
+
 void Info(const char *message, int timeout, int width, int height, int frame)
 {
 	if (menustate <= MENU_INFO)
@@ -6974,7 +7257,7 @@ int menu_lightgun_cb(int idx, uint16_t type, uint16_t code, int value)
 
 	if (type == EV_KEY)
 	{
-		if ((code == 0x130 || code == 0x131 || code == 0x120) && menustate == MENU_LGCAL1)
+		if ((code == 0x130 || code == 0x131 || code == 0x120 || code == 0x110) && menustate == MENU_LGCAL1)
 		{
 			gun_idx = idx;
 			if (value == 1) gun_ok = 1;
@@ -7013,7 +7296,7 @@ int menu_allow_cfg_switch()
 
 void menu_process_save()
 {
-	menu_save_timer = GetTimer(1000);
+	menu_save_timer = GetTimer(500);
 }
 
 static char pchar[] = { 0x8C, 0x8E, 0x8F, 0x90, 0x91, 0x7F };

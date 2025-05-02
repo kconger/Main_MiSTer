@@ -437,6 +437,29 @@ static bool parse_mapping_string(char *map_str, char *guid, int dev_fd, uint32_t
 		}
 
 		if (fill_map[SYS_BTN_OSD_KTGL+2] == 0) fill_map[SYS_BTN_OSD_KTGL+2] = fill_map[SYS_BTN_OSD_KTGL+1];
+
+
+    //Some controllers without analog sticks use the left stick axes for the dpad instead of using the hat axes
+    //When these are mapped to dpad directions in an entry, it results in the mister 
+    //having no mapping for the corresponding analog axis. 
+    //any analog axis that isn't mapped to either SYS_AXIS1 or SYS_AXIS2 is treated like a trigger and only generates
+    //'fake' digital inputs on the axis max. This results in only two dpad directions working.
+    //Populate the entries for SYS_AXIS1 based on what the dpad was mapped to, but only if the entry didn't map the analog
+    //axes itself.
+    
+    if (!fill_map[SYS_AXIS1_X] && fill_map[SYS_BTN_RIGHT] > KEY_EMU)
+    {
+						uint16_t axis_idx = (fill_map[SYS_BTN_RIGHT] - KEY_EMU) >> 1;
+            fill_map[SYS_AXIS1_X] = axis_idx | 0x20000;
+    }
+
+    if (!fill_map[SYS_AXIS1_Y] && fill_map[SYS_BTN_UP] > KEY_EMU)
+    {
+						uint16_t axis_idx = (fill_map[SYS_BTN_UP] - KEY_EMU) >> 1;
+            fill_map[SYS_AXIS1_Y] = axis_idx | 0x20000;
+    }
+
+
 		if (fill_map[SYS_AXIS_X] == 0) fill_map[SYS_AXIS_X] = fill_map[SYS_AXIS1_X];
 		if (fill_map[SYS_AXIS_Y] == 0) fill_map[SYS_AXIS_Y] = fill_map[SYS_AXIS1_Y];
 	}
@@ -514,7 +537,6 @@ static void gcdb_cache_controller_map(uint16_t bustype, uint16_t vid, uint16_t p
 	last_db_idx = (last_db_idx +1) % MAX_GCDB_ENTRIES;
 }
 
-
 bool gcdb_map_for_controller(uint16_t bustype, uint16_t vid, uint16_t pid, uint16_t version, int dev_fd, uint32_t *fill_map)
 {
 		PROFILE_FUNCTION();
@@ -546,12 +568,3 @@ bool gcdb_map_for_controller(uint16_t bustype, uint16_t vid, uint16_t pid, uint1
 		}
 		return false;
 }
-
-
-
-
-
-
-
-
-

@@ -2,7 +2,6 @@
 #include "support/minimig/minimig_config.h"
 #include "support/minimig/minimig_boot.h"
 #include "support/minimig/minimig_fdd.h"
-#include "support/minimig/minimig_hdd.h"
 #include "support/minimig/minimig_share.h"
 
 // SharpMz support
@@ -19,6 +18,10 @@
 
 // SNES  support
 #include "support/snes/snes.h"
+
+// N64  support
+#include "support/n64/n64.h"
+#include "support/n64/n64_joy_emu.h"
 
 // NeoGeo  support
 #include "support/neogeo/neogeo_loader.h"
@@ -40,8 +43,15 @@
 // PSX support
 #include "support/psx/psx.h"
 
+// CD-i support
+#include "support/cdi/cdi.h"
+
 // UEF support
 #include "support/uef/uef_reader.h"
 
 // Saturn  support
 #include "support/saturn/saturn.h"
+
+// N64 support
+#include "support/n64/n64.h"
+#include "support/n64/n64_joy_emu.h"
