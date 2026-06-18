@@ -1,8 +1,11 @@
 #include <ctype.h>
+#include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <algorithm>
+#include <vector>
 
 #include "../../hardware.h"
 #include "../../menu.h"
@@ -26,6 +29,8 @@ static constexpr auto MD5_LENGTH = 16U;
 static constexpr auto CARTID_PREFIX = "ID:";
 static constexpr auto RESET_OPT = "[0]";
 static constexpr auto RELOAD_SAVE_OPT = "[40]";
+static constexpr auto SAVE_BACKUP_OPT = "[41]";
+static constexpr auto AUTOSAVE_OPT = "[42]";
 static constexpr auto AUTODETECT_OPT = "[64]";
 static constexpr auto CIC_TYPE_OPT = "[68:65]";
 static constexpr auto NO_EPAK_OPT = "[70]";
@@ -145,6 +150,15 @@ struct patch_data {
 static uint8_t loaded = 0;
 static char current_rom_path[1024] = { '\0' };
 static char current_rom_path_gb[1024] = { '\0' };
+static char current_dd_disk_path[1024] = { '\0' };
+static char current_dd_save_path[1024] = { '\0' };
+static char current_dd_flat_save_path[1024] = { '\0' };
+static uint32_t current_dd_load_addr = 0;
+static uint8_t current_dd_disk_loaded = 0;
+static uint8_t current_dd_skip_initial_osd_save = 0;
+static uint8_t current_dd_cart_expansion = 0;
+static uint8_t current_dd_disk_type = 0;
+static char current_dd_disk_id[5] = {};
 static char old_save_path[1024];
 static void* rdram_ptr = nullptr;
 static cheat_code* cheat_codes = nullptr;
@@ -1413,6 +1427,8 @@ void n64_cheats_send(const void* buf_ptr, const uint32_t size) {
 	cheat_codes_count = size;
 }
 
+static void n64dd_poll_save();
+
 static unsigned long poll_timer = 0;
 
 void n64_reset() {
@@ -1481,7 +1497,1857 @@ void n64_poll() {
 				}
 			}
 		}
+
+		n64dd_poll_save();
 	}
+}
+
+static constexpr uint32_t N64_ROM_FASTLOAD_ADDR = 0x32000000;
+static constexpr uint32_t N64DD_IPL_LOAD_ADDR = 0x33BC0000;
+static constexpr const char* N64DD_IPL_BOOT_FILE = "boot3.rom";
+static constexpr uint32_t N64DD_IPL_SIZE = 4 * 1024 * 1024;
+static constexpr uint32_t N64DD_NDD_SIZE = 0x03DEC800;
+static constexpr uint32_t N64DD_PHYSICAL_SIZE = 0x0435B0C0;
+static constexpr uint32_t N64DD_EXPANDED_SIZE = 0x06E28000;
+static constexpr uint32_t N64DD_SYSTEM_SECTOR_LENGTH = 232;
+static constexpr uint32_t N64DD_SECTORS_PER_BLOCK = 85;
+static constexpr uint32_t N64DD_BAD_TRACKS_PER_ZONE = 12;
+static constexpr uint32_t N64DD_FLAT_HEAD_STRIDE = 0x03714000;
+static constexpr uint32_t N64DD_FLAT_TRACK_STRIDE = 0x0000C000;
+static constexpr uint32_t N64DD_FLAT_BLOCK_STRIDE = 0x00006000;
+static constexpr uint32_t N64DD_FLAT_SECTOR_STRIDE = 0x00000100;
+static constexpr uint32_t N64DD_FLAT_TRACKS_PER_HEAD = 1175;
+static constexpr uint32_t N64DD_DIRTY_FLAG_OFFSET = 0x00005F00;
+static constexpr uint32_t N64DD_DIRTY_MARKER_SIZE = 8;
+static constexpr uint32_t N64DD_FLAT_SAVE_HEADER_SIZE = 24;
+static constexpr uint32_t N64DD_FLAT_SAVE_ENTRY_SIZE = 4 + N64DD_FLAT_SECTOR_STRIDE;
+static constexpr uint8_t N64DD_BAD_BLOCK_FILL = 0xDD;
+static constexpr uint32_t N64DD_SAVE_CHUNK_SIZE = 1024 * 1024;
+static constexpr uint8_t N64DD_FLAT_SAVE_MAGIC[8] = {'M', '6', '4', 'D', 'D', 'F', '1', 0};
+static constexpr uint8_t N64DD_DIRTY_MAGIC_BYTE = 0xD1;
+static constexpr bool N64DD_VERBOSE_LOG = false;
+
+static bool n64dd_load_save_to_mem(const char* save_path, const char* disk_path, uint8_t* mem, uint8_t disk_type);
+static bool n64dd_load_flat_save_to_mem(const char* save_path, uint8_t* mem);
+static bool n64dd_save_disk_image(const char* save_path, const char* disk_path, uint8_t* mem, uint8_t disk_type, bool force);
+static bool n64dd_save_flat_patch(const char* save_path, const char* physical_save_path, const char* disk_path,
+	uint8_t* mem, uint8_t disk_type, bool force);
+
+static void n64dd_clear_disk_save_state() {
+	current_dd_disk_path[0] = '\0';
+	current_dd_save_path[0] = '\0';
+	current_dd_flat_save_path[0] = '\0';
+	current_dd_load_addr = 0;
+	current_dd_disk_loaded = 0;
+	current_dd_skip_initial_osd_save = 0;
+	current_dd_cart_expansion = 0;
+	current_dd_disk_type = 0;
+	current_dd_disk_id[0] = '\0';
+}
+
+static void n64dd_create_save_path(char* save_path, const char* disk_path) {
+	create_path(SAVE_DIR, CoreName2);
+
+	const char* fname = strrchr(disk_path, '/');
+	const char* fname_backslash = strrchr(disk_path, '\\');
+	if (fname_backslash && (!fname || fname_backslash > fname)) fname = fname_backslash;
+	fname = fname ? fname + 1 : disk_path;
+
+	char base_name[1024];
+	strncpy(base_name, fname, sizeof(base_name) - 1);
+	base_name[sizeof(base_name) - 1] = '\0';
+
+	char* ext = strrchr(base_name, '.');
+	if (ext) *ext = '\0';
+
+	snprintf(save_path, 1024, SAVE_DIR"/%s/%s.disk", CoreName2, base_name);
+}
+
+static void n64dd_create_flat_save_path(char* save_path, const char* disk_path) {
+	n64dd_create_save_path(save_path, disk_path);
+	char* ext = strrchr(save_path, '.');
+	if (ext) strcpy(ext, ".ddsave");
+	else strcat(save_path, ".ddsave");
+}
+
+static bool n64dd_save_disk_to_file(bool force) {
+	if (!current_dd_disk_loaded || !current_dd_load_addr || !current_dd_save_path[0] ||
+		!current_dd_flat_save_path[0] || !current_dd_disk_path[0]) return false;
+
+	const uint8_t preserve_osd = user_io_osd_is_visible() ? 1 : 0;
+	uint8_t* mem = (uint8_t*)shmem_map(fpga_mem(current_dd_load_addr), N64DD_EXPANDED_SIZE);
+	if (!mem || mem == (uint8_t*)-1) {
+		printf("64DD save: failed to map DDRAM disk image.\n");
+		return false;
+	}
+
+	const bool flat_ok = n64dd_save_flat_patch(current_dd_flat_save_path, current_dd_save_path,
+		current_dd_disk_path, mem, current_dd_disk_type, force);
+	const bool physical_ok = flat_ok ? false : n64dd_save_disk_image(current_dd_save_path, current_dd_disk_path, mem, current_dd_disk_type, force);
+
+	shmem_unmap(mem, N64DD_EXPANDED_SIZE);
+	if (!preserve_osd) ProgressMessage();
+	return flat_ok || physical_ok;
+}
+
+static bool n64dd_save_now(bool force, const char* reason) {
+	if (!current_dd_disk_loaded) return false;
+	const char* save_reason = reason ? reason : "forced";
+	const bool ok = n64dd_save_disk_to_file(force);
+	if (!ok) printf("64DD save: %s save failed.\n", save_reason);
+	return ok;
+}
+
+static bool n64dd_flush_pending_save_before_disk_change() {
+	return n64dd_save_now(true, "disk-change");
+}
+
+void n64_save_dd_disk() {
+	n64dd_save_now(true, "manual");
+	current_dd_skip_initial_osd_save = 0;
+}
+
+static void n64dd_poll_save() {
+	static uint8_t previous_manual_save = 0;
+	static uint8_t previous_osd_visible = 0;
+	const uint8_t manual_save = user_io_status_get(SAVE_BACKUP_OPT) ? 1 : 0;
+	const uint8_t osd_visible = user_io_osd_is_visible() ? 1 : 0;
+	const bool autosave_enabled = !user_io_status_get(AUTOSAVE_OPT);
+	bool saved_this_poll = false;
+
+	if (!current_dd_disk_loaded) {
+		previous_manual_save = manual_save;
+		previous_osd_visible = osd_visible;
+		current_dd_skip_initial_osd_save = 0;
+		return;
+	}
+
+	if (manual_save && !previous_manual_save) {
+		n64dd_save_now(true, "manual");
+		saved_this_poll = true;
+		current_dd_skip_initial_osd_save = 0;
+	}
+	previous_manual_save = manual_save;
+
+	if (autosave_enabled && !previous_osd_visible && osd_visible) {
+		if (current_dd_skip_initial_osd_save) {
+			current_dd_skip_initial_osd_save = 0;
+		} else if (!saved_this_poll) {
+			n64dd_save_now(true, "OSD-open");
+		}
+	}
+	if (!osd_visible && current_dd_skip_initial_osd_save) {
+		current_dd_skip_initial_osd_save = 0;
+	}
+	previous_osd_visible = osd_visible;
+}
+
+struct n64dd_zone {
+	uint8_t head;
+	uint16_t sector_length;
+	uint16_t tracks;
+	uint16_t track_offset;
+};
+
+struct n64dd_sector_map_entry {
+	uint32_t flat_offset;
+	uint32_t physical_offset;
+	uint32_t source_offset;
+	uint16_t sector_length;
+	uint8_t pzone;
+};
+
+static constexpr n64dd_zone N64DD_ZONES[16] = {
+	{0, 232, 158, 0},    {0, 216, 158, 158},  {0, 208, 149, 316},  {0, 192, 149, 465},
+	{0, 176, 149, 614},  {0, 160, 149, 763},  {0, 144, 149, 912},  {0, 128, 114, 1061},
+	{1, 216, 158, 0},    {1, 208, 158, 158},  {1, 192, 149, 316},  {1, 176, 149, 465},
+	{1, 160, 149, 614},  {1, 144, 149, 763},  {1, 128, 149, 912},  {1, 112, 114, 1061},
+};
+
+static constexpr uint8_t N64DD_VZONE_TO_PZONE[7][16] = {
+	{0, 1, 2, 9, 8, 3, 4, 5, 6, 7, 15, 14, 13, 12, 11, 10},
+	{0, 1, 2, 3, 10, 9, 8, 4, 5, 6, 7, 15, 14, 13, 12, 11},
+	{0, 1, 2, 3, 4, 11, 10, 9, 8, 5, 6, 7, 15, 14, 13, 12},
+	{0, 1, 2, 3, 4, 5, 12, 11, 10, 9, 8, 6, 7, 15, 14, 13},
+	{0, 1, 2, 3, 4, 5, 6, 13, 12, 11, 10, 9, 8, 7, 15, 14},
+	{0, 1, 2, 3, 4, 5, 6, 7, 14, 13, 12, 11, 10, 9, 8, 15},
+	{0, 1, 2, 3, 4, 5, 6, 7, 15, 14, 13, 12, 11, 10, 9, 8},
+};
+static constexpr uint16_t N64DD_VZONE_LBA[7][16] = {
+	{0x0124, 0x0248, 0x035A, 0x047E, 0x05A2, 0x06B4, 0x07C6, 0x08D8, 0x09EA, 0x0AB6, 0x0B82, 0x0C94, 0x0DA6, 0x0EB8, 0x0FCA, 0x10DC},
+	{0x0124, 0x0248, 0x035A, 0x046C, 0x057E, 0x06A2, 0x07C6, 0x08D8, 0x09EA, 0x0AFC, 0x0BC8, 0x0C94, 0x0DA6, 0x0EB8, 0x0FCA, 0x10DC},
+	{0x0124, 0x0248, 0x035A, 0x046C, 0x057E, 0x0690, 0x07A2, 0x08C6, 0x09EA, 0x0AFC, 0x0C0E, 0x0CDA, 0x0DA6, 0x0EB8, 0x0FCA, 0x10DC},
+	{0x0124, 0x0248, 0x035A, 0x046C, 0x057E, 0x0690, 0x07A2, 0x08B4, 0x09C6, 0x0AEA, 0x0C0E, 0x0D20, 0x0DEC, 0x0EB8, 0x0FCA, 0x10DC},
+	{0x0124, 0x0248, 0x035A, 0x046C, 0x057E, 0x0690, 0x07A2, 0x08B4, 0x09C6, 0x0AD8, 0x0BEA, 0x0D0E, 0x0E32, 0x0EFE, 0x0FCA, 0x10DC},
+	{0x0124, 0x0248, 0x035A, 0x046C, 0x057E, 0x0690, 0x07A2, 0x086E, 0x0980, 0x0A92, 0x0BA4, 0x0CB6, 0x0DC8, 0x0EEC, 0x1010, 0x10DC},
+	{0x0124, 0x0248, 0x035A, 0x046C, 0x057E, 0x0690, 0x07A2, 0x086E, 0x093A, 0x0A4C, 0x0B5E, 0x0C70, 0x0D82, 0x0E94, 0x0FB8, 0x10DC},
+};
+static constexpr uint32_t N64DD_ZONE_START[16] = {
+	0x0000000, 0x05F15E0, 0x0B79D00, 0x10801A0, 0x1523720, 0x1963D80, 0x1D414C0, 0x20BBCE0,
+	0x23196E0, 0x28A1E00, 0x2DF5DC0, 0x3299340, 0x36D99A0, 0x3AB70E0, 0x3E31900, 0x4149200,
+};
+static constexpr uint16_t N64DD_TRACK_BASE[8] = {0x000, 0x09E, 0x13C, 0x1D1, 0x266, 0x2FB, 0x390, 0x425};
+static constexpr uint16_t N64DD_ARES_TRACK_PHYSICAL[16] = {
+	0x000, 0x09E, 0x13C, 0x1D1, 0x266, 0x2FB, 0x390, 0x425,
+	0x091, 0x12F, 0x1C4, 0x259, 0x2EE, 0x383, 0x418, 0x48A,
+};
+static constexpr uint16_t N64DD_BLOCK_SIZE[16] = {
+	0x4D08, 0x47B8, 0x4510, 0x3FC0, 0x3A70, 0x3520, 0x2FD0, 0x2A80,
+	0x47B8, 0x4510, 0x3FC0, 0x3A70, 0x3520, 0x2FD0, 0x2A80, 0x2530,
+};
+
+static bool n64dd_read_exact(fileTYPE* file, uint64_t offset, uint8_t* data, uint32_t size) {
+	if (!FileSeek(file, offset, SEEK_SET)) return false;
+	const int read = FileReadAdv(file, data, size);
+	return read >= 0 && static_cast<uint32_t>(read) == size;
+}
+
+static bool n64dd_copy_ipl_to_mem(fileTYPE* file, const char* name, uint8_t* ddipl_dest, uint8_t* boot_dest, uint32_t size) {
+	static uint8_t buf[4096];
+	ByteOrder rom_endianness = ByteOrder::BIG_ENDIAN;
+	bool is_first_chunk = true;
+	uint32_t copied = 0;
+
+	if (!FileSeek(file, 0, SEEK_SET)) return false;
+
+	while (copied < size) {
+		uint32_t chunk = std::min<uint32_t>(sizeof(buf), size - copied);
+		const int read = FileReadAdv(file, buf, chunk);
+		if (read < 0 || static_cast<uint32_t>(read) != chunk) return false;
+
+		if (is_first_chunk) {
+			if (chunk < 4096) {
+				printf("Failed to load 64DD IPL: must be at least 4096 bytes.\n");
+				return false;
+			}
+
+			rom_endianness = detect_rom_endianness(buf);
+		}
+
+		normalize_data(buf, chunk, rom_endianness);
+
+		if (is_first_chunk && boot_dest) {
+			uint64_t bootcode_sums[2] = { };
+			calc_bootcode_checksums(bootcode_sums, buf);
+			detect_rom_settings_from_first_chunk((char)buf[0x3e], bootcode_sums, sizeof(bootcode_sums) / sizeof(*bootcode_sums));
+			if (is_auto()) set_cart_save_type(MemoryType::NONE);
+		}
+
+		memcpy(ddipl_dest + copied, buf, chunk);
+		if (boot_dest) memcpy(boot_dest + copied, buf, chunk);
+
+		copied += chunk;
+		is_first_chunk = false;
+		ProgressMessage("Loading", name, copied, size);
+	}
+
+	return true;
+}
+
+static uint32_t n64dd_expanded_offset(uint32_t track, uint32_t head, uint32_t block) {
+	uint32_t zone = 0;
+	for (uint32_t i = 1; i < 8; i++) {
+		if (track >= N64DD_TRACK_BASE[i]) zone = i;
+	}
+	if (head) zone += 8;
+
+	uint32_t track_in_zone = track - N64DD_TRACK_BASE[zone & 7];
+	return N64DD_ZONE_START[zone] + (N64DD_BLOCK_SIZE[zone] * 2 * track_in_zone) + (N64DD_BLOCK_SIZE[zone] * block);
+}
+
+static uint32_t n64dd_flat_offset(uint32_t track, uint32_t head, uint32_t block, uint32_t sector) {
+	if (sector >= 90) sector -= 90;
+	if (sector > 84) sector = 84;
+
+	return (head ? N64DD_FLAT_HEAD_STRIDE : 0) +
+		(track * N64DD_FLAT_TRACK_STRIDE) +
+		(block * N64DD_FLAT_BLOCK_STRIDE) +
+		(sector * N64DD_FLAT_SECTOR_STRIDE);
+}
+
+static bool n64dd_mark_bad_flat_block(uint8_t* dest, uint32_t track, uint32_t head, uint32_t block) {
+	const uint32_t dest_offset = n64dd_flat_offset(track, head, block, 0);
+	if ((dest_offset + N64DD_FLAT_BLOCK_STRIDE) > N64DD_EXPANDED_SIZE) return false;
+	for (uint32_t sector = 0; sector < N64DD_SECTORS_PER_BLOCK; sector++) {
+		memset(dest + dest_offset + (sector * N64DD_FLAT_SECTOR_STRIDE) + 0xF8, N64DD_BAD_BLOCK_FILL, 8);
+	}
+	return true;
+}
+
+static bool n64dd_copy_block_to_flat(fileTYPE* file, uint64_t source_offset, uint8_t* dest,
+	uint32_t track, uint32_t head, uint32_t block, uint32_t sector_length, std::vector<uint8_t>& block_data) {
+	const uint32_t block_length = sector_length * N64DD_SECTORS_PER_BLOCK;
+	block_data.resize(block_length);
+
+	if (!n64dd_read_exact(file, source_offset, block_data.data(), block_length)) return false;
+
+	for (uint32_t sector = 0; sector < N64DD_SECTORS_PER_BLOCK; sector++) {
+		const uint32_t dest_offset = n64dd_flat_offset(track, head, block, sector);
+		if ((dest_offset + sector_length) > N64DD_EXPANDED_SIZE) return false;
+		memcpy(dest + dest_offset, block_data.data() + (sector * sector_length), sector_length);
+	}
+
+	return true;
+}
+
+static bool n64dd_copy_file_to_vector(fileTYPE* file, std::vector<uint8_t>& data, uint32_t expected_size,
+	const char* progress_title, const char* progress_name) {
+	data.resize(expected_size);
+	if (!FileSeek(file, 0, SEEK_SET)) return false;
+
+	uint32_t copied = 0;
+	while (copied < expected_size) {
+		const uint32_t chunk = std::min<uint32_t>(N64DD_SAVE_CHUNK_SIZE, expected_size - copied);
+		const int read = FileReadAdv(file, data.data() + copied, (int)chunk);
+		if (read < 0 || static_cast<uint32_t>(read) != chunk) return false;
+
+		copied += chunk;
+		if (progress_title) ProgressMessage(progress_title, progress_name, copied, expected_size);
+	}
+
+	return true;
+}
+
+static bool n64dd_write_vector_to_file(const char* save_path, const std::vector<uint8_t>& data) {
+	const uint32_t total_size = (uint32_t)data.size();
+	fileTYPE save_file = {};
+	if (!FileOpenEx(&save_file, save_path, O_CREAT | O_TRUNC | O_RDWR | O_SYNC, 0, 0)) {
+		printf("64DD save: failed to create \"%s\".\n", save_path);
+		return false;
+	}
+
+	uint32_t written = 0;
+	while (written < total_size) {
+		const uint32_t chunk = std::min<uint32_t>(N64DD_SAVE_CHUNK_SIZE, total_size - written);
+		const int ret = FileWriteAdv(&save_file, const_cast<uint8_t*>(data.data() + written), (int)chunk);
+		if (ret < 0 || static_cast<uint32_t>(ret) != chunk) {
+			printf("64DD save: failed writing \"%s\" at 0x%08x.\n", save_path, written);
+			FileClose(&save_file);
+			return false;
+		}
+		written += chunk;
+		ProgressMessage("Saving 64DD disk", save_path, written, total_size);
+	}
+
+	FileClose(&save_file);
+	return true;
+}
+
+static void n64dd_append_u32(std::vector<uint8_t>& data, uint32_t value) {
+	data.push_back((uint8_t)(value >> 0));
+	data.push_back((uint8_t)(value >> 8));
+	data.push_back((uint8_t)(value >> 16));
+	data.push_back((uint8_t)(value >> 24));
+}
+
+static uint32_t n64dd_read_u32(const uint8_t* data) {
+	return ((uint32_t)data[0] << 0) |
+		((uint32_t)data[1] << 8) |
+		((uint32_t)data[2] << 16) |
+		((uint32_t)data[3] << 24);
+}
+
+struct n64dd_flat_save_entry {
+	uint32_t flat_offset;
+	uint8_t data[N64DD_FLAT_SECTOR_STRIDE];
+};
+
+static bool n64dd_flat_block_is_dirty(const uint8_t* flat, uint32_t block_offset) {
+	const uint32_t marker_offset = block_offset + N64DD_DIRTY_FLAG_OFFSET;
+	if ((marker_offset + N64DD_DIRTY_MARKER_SIZE) > N64DD_EXPANDED_SIZE) return false;
+
+	for (uint32_t i = 0; i < N64DD_DIRTY_MARKER_SIZE; i++) {
+		if (flat[marker_offset + i] != N64DD_DIRTY_MAGIC_BYTE) return false;
+	}
+	return true;
+}
+
+static bool n64dd_find_dirty_flat_blocks(const uint8_t* flat, std::vector<uint32_t>& dirty_blocks) {
+	dirty_blocks.clear();
+	for (uint32_t head = 0; head < 2; head++) {
+		for (uint32_t track = 0; track < N64DD_FLAT_TRACKS_PER_HEAD; track++) {
+			for (uint32_t block = 0; block < 2; block++) {
+				const uint32_t block_offset = n64dd_flat_offset(track, head, block, 0);
+				if ((block_offset + N64DD_DIRTY_FLAG_OFFSET + N64DD_DIRTY_MARKER_SIZE) > N64DD_EXPANDED_SIZE) {
+					return false;
+				}
+				if (n64dd_flat_block_is_dirty(flat, block_offset)) dirty_blocks.push_back(block_offset);
+			}
+		}
+	}
+	return true;
+}
+
+static void n64dd_clear_dirty_flat_blocks(uint8_t* flat, const std::vector<uint32_t>& dirty_blocks) {
+	for (uint32_t block_offset : dirty_blocks) {
+		const uint32_t marker_offset = block_offset + N64DD_DIRTY_FLAG_OFFSET;
+		if ((marker_offset + N64DD_DIRTY_MARKER_SIZE) <= N64DD_EXPANDED_SIZE) {
+			memset(flat + marker_offset, 0, N64DD_DIRTY_MARKER_SIZE);
+		}
+	}
+}
+
+static bool n64dd_read_flat_save_entries(const char* save_path, std::vector<n64dd_flat_save_entry>& entries) {
+	entries.clear();
+	if (!FileExists(save_path, 0)) return true;
+
+	fileTYPE save_file = {};
+	if (!FileOpenEx(&save_file, save_path, O_RDONLY, 0, 0)) {
+		printf("64DD flat save: failed to open \"%s\".\n", save_path);
+		return false;
+	}
+
+	if ((uint64_t)save_file.size < N64DD_FLAT_SAVE_HEADER_SIZE ||
+		((uint64_t)save_file.size - N64DD_FLAT_SAVE_HEADER_SIZE) % N64DD_FLAT_SAVE_ENTRY_SIZE) {
+		printf("64DD flat save: refusing to update \"%s\" with invalid size %llu bytes.\n",
+			save_path,
+			(unsigned long long)save_file.size);
+		FileClose(&save_file);
+		return false;
+	}
+
+	std::vector<uint8_t> patch;
+	const uint32_t patch_size = (uint32_t)save_file.size;
+	const bool read_ok = n64dd_copy_file_to_vector(&save_file, patch, patch_size, nullptr, nullptr);
+	FileClose(&save_file);
+	if (!read_ok) {
+		printf("64DD flat save: failed reading \"%s\".\n", save_path);
+		return false;
+	}
+
+	if (memcmp(patch.data(), N64DD_FLAT_SAVE_MAGIC, sizeof(N64DD_FLAT_SAVE_MAGIC))) {
+		printf("64DD flat save: refusing to update \"%s\" with unknown magic.\n", save_path);
+		return false;
+	}
+
+	const uint32_t expanded_size = n64dd_read_u32(patch.data() + 8);
+	const uint32_t sector_stride = n64dd_read_u32(patch.data() + 12);
+	const uint32_t changed_sectors = n64dd_read_u32(patch.data() + 20);
+	const uint32_t actual_sectors = (patch_size - N64DD_FLAT_SAVE_HEADER_SIZE) / N64DD_FLAT_SAVE_ENTRY_SIZE;
+	if (expanded_size != N64DD_EXPANDED_SIZE || sector_stride != N64DD_FLAT_SECTOR_STRIDE || changed_sectors != actual_sectors) {
+		printf("64DD flat save: refusing to update \"%s\" with incompatible header.\n", save_path);
+		return false;
+	}
+
+	entries.reserve(changed_sectors);
+	const uint8_t* entry_ptr = patch.data() + N64DD_FLAT_SAVE_HEADER_SIZE;
+	for (uint32_t i = 0; i < changed_sectors; i++) {
+		n64dd_flat_save_entry entry = {};
+		entry.flat_offset = n64dd_read_u32(entry_ptr);
+		entry_ptr += 4;
+		if ((entry.flat_offset + N64DD_FLAT_SECTOR_STRIDE) > N64DD_EXPANDED_SIZE) {
+			printf("64DD flat save: refusing to update \"%s\" with out-of-range sector 0x%08x.\n",
+				save_path,
+				entry.flat_offset);
+			return false;
+		}
+		memcpy(entry.data, entry_ptr, N64DD_FLAT_SECTOR_STRIDE);
+		entry_ptr += N64DD_FLAT_SECTOR_STRIDE;
+
+		auto existing = std::find_if(entries.begin(), entries.end(),
+			[&](const n64dd_flat_save_entry& item) { return item.flat_offset == entry.flat_offset; });
+		if (existing != entries.end()) {
+			memcpy(existing->data, entry.data, N64DD_FLAT_SECTOR_STRIDE);
+		} else {
+			entries.push_back(entry);
+		}
+	}
+
+	return true;
+}
+
+static void n64dd_update_flat_save_entry(std::vector<n64dd_flat_save_entry>& entries, uint32_t flat_offset, const uint8_t* data) {
+	for (auto& entry : entries) {
+		if (entry.flat_offset == flat_offset) {
+			memcpy(entry.data, data, N64DD_FLAT_SECTOR_STRIDE);
+			return;
+		}
+	}
+
+	n64dd_flat_save_entry entry = {};
+	entry.flat_offset = flat_offset;
+	memcpy(entry.data, data, N64DD_FLAT_SECTOR_STRIDE);
+	entries.push_back(entry);
+}
+
+static void n64dd_remove_flat_save_entry(std::vector<n64dd_flat_save_entry>& entries, uint32_t flat_offset) {
+	entries.erase(std::remove_if(entries.begin(), entries.end(),
+		[&](const n64dd_flat_save_entry& entry) { return entry.flat_offset == flat_offset; }), entries.end());
+}
+
+static void n64dd_build_flat_save_vector(std::vector<uint8_t>& patch,
+	std::vector<n64dd_flat_save_entry>& entries, uint8_t disk_type) {
+	std::sort(entries.begin(), entries.end(),
+		[](const n64dd_flat_save_entry& a, const n64dd_flat_save_entry& b) { return a.flat_offset < b.flat_offset; });
+
+	patch.clear();
+	patch.insert(patch.end(), N64DD_FLAT_SAVE_MAGIC, N64DD_FLAT_SAVE_MAGIC + sizeof(N64DD_FLAT_SAVE_MAGIC));
+	n64dd_append_u32(patch, N64DD_EXPANDED_SIZE);
+	n64dd_append_u32(patch, N64DD_FLAT_SECTOR_STRIDE);
+	n64dd_append_u32(patch, disk_type);
+	n64dd_append_u32(patch, (uint32_t)entries.size());
+
+	for (const auto& entry : entries) {
+		n64dd_append_u32(patch, entry.flat_offset);
+		patch.insert(patch.end(), entry.data, entry.data + N64DD_FLAT_SECTOR_STRIDE);
+	}
+}
+
+static bool n64dd_file_matches_vector(const char* path, const std::vector<uint8_t>& data) {
+	if (!FileExists(path, 0)) return false;
+
+	fileTYPE file = {};
+	if (!FileOpenEx(&file, path, O_RDONLY, 0, 0)) return false;
+	if ((uint64_t)file.size != data.size()) {
+		FileClose(&file);
+		return false;
+	}
+
+	static std::vector<uint8_t> existing;
+	existing.resize(N64DD_SAVE_CHUNK_SIZE);
+	uint32_t checked = 0;
+	while (checked < data.size()) {
+		const uint32_t chunk = std::min<uint32_t>(N64DD_SAVE_CHUNK_SIZE, (uint32_t)data.size() - checked);
+		const int read = FileReadAdv(&file, existing.data(), (int)chunk);
+		if (read < 0 || static_cast<uint32_t>(read) != chunk || memcmp(existing.data(), data.data() + checked, chunk)) {
+			FileClose(&file);
+			return false;
+		}
+		checked += chunk;
+	}
+
+	FileClose(&file);
+	return true;
+}
+
+static bool n64dd_physical_save_exists(const char* save_path) {
+	if (!save_path || !save_path[0] || !FileExists(save_path, 0)) return false;
+
+	fileTYPE save_file = {};
+	if (!FileOpenEx(&save_file, save_path, O_RDONLY, 0, 0)) return false;
+	const bool exists = (uint64_t)save_file.size == N64DD_PHYSICAL_SIZE;
+	FileClose(&save_file);
+	return exists;
+}
+
+static bool n64dd_pzone_is_writable(uint32_t pzone, uint8_t disk_type) {
+	const uint32_t track_zone = pzone & 7;
+	const uint32_t head = pzone >= 8 ? 1 : 0;
+	return disk_type < 7 && (track_zone + head) > ((uint32_t)disk_type + 2);
+}
+
+static uint8_t n64dd_bcd(uint32_t value) {
+	value %= 100;
+	return (uint8_t)(((value / 10) << 4) | (value % 10));
+}
+
+static uint32_t n64dd_hash_string(const char* text) {
+	uint32_t hash = 2166136261U;
+	while (text && *text) {
+		hash ^= (uint8_t)*text++;
+		hash *= 16777619U;
+	}
+	return hash;
+}
+
+static void n64dd_make_disk_id_stamp(const char* disk_path, uint8_t stamp[8]) {
+	const uint32_t hash = n64dd_hash_string(disk_path);
+	stamp[0] = (uint8_t)(hash >> 24);
+	stamp[1] = n64dd_bcd(20);
+	stamp[2] = n64dd_bcd(26);
+	stamp[3] = n64dd_bcd(1 + (hash % 12));
+	stamp[4] = n64dd_bcd(1 + ((hash >> 4) % 28));
+	stamp[5] = n64dd_bcd((hash >> 9) % 24);
+	stamp[6] = n64dd_bcd((hash >> 14) % 60);
+	stamp[7] = n64dd_bcd((hash >> 20) % 60);
+}
+
+static void n64dd_stamp_disk_id_sector(uint8_t* sector, const uint8_t stamp[8]) {
+	sector[0x0B] = stamp[0];
+	sector[0x0C] = 'M';
+	sector[0x0D] = 'I';
+	sector[0x0E] = 'S';
+	sector[0x0F] = 'T';
+	sector[0x11] = stamp[1];
+	sector[0x12] = stamp[2];
+	sector[0x13] = stamp[3];
+	sector[0x14] = stamp[4];
+	sector[0x15] = stamp[5];
+	sector[0x16] = stamp[6];
+	sector[0x17] = stamp[7];
+}
+
+static bool n64dd_overlay_changed_flat_writable_to_physical(const uint8_t* flat, const uint8_t* original_flat,
+	std::vector<uint8_t>& physical, uint8_t disk_type, uint32_t& changed_sectors) {
+	if (physical.size() != N64DD_PHYSICAL_SIZE || disk_type >= 7) return false;
+
+	changed_sectors = 0;
+	for (uint32_t pzone = 0; pzone < 16; pzone++) {
+		if (!n64dd_pzone_is_writable(pzone, disk_type)) continue;
+
+		const auto& zone = N64DD_ZONES[pzone];
+		for (uint32_t zone_track = 0; zone_track < zone.tracks; zone_track++) {
+			const uint32_t track = zone.track_offset + zone_track;
+			for (uint32_t block = 0; block < 2; block++) {
+				const uint32_t physical_offset = n64dd_expanded_offset(track, zone.head, block);
+				const uint32_t flat_offset = n64dd_flat_offset(track, zone.head, block, 0);
+				const uint32_t physical_block_length = zone.sector_length * N64DD_SECTORS_PER_BLOCK;
+
+				if ((physical_offset + physical_block_length) > N64DD_PHYSICAL_SIZE) return false;
+				if ((flat_offset + N64DD_FLAT_BLOCK_STRIDE) > N64DD_EXPANDED_SIZE) return false;
+
+				for (uint32_t sector = 0; sector < N64DD_SECTORS_PER_BLOCK; sector++) {
+					const uint32_t physical_sector_offset = physical_offset + (sector * zone.sector_length);
+					const uint32_t flat_sector_offset = flat_offset + (sector * N64DD_FLAT_SECTOR_STRIDE);
+					if (memcmp(flat + flat_sector_offset, original_flat + flat_sector_offset, zone.sector_length)) {
+						memcpy(physical.data() + physical_sector_offset, flat + flat_sector_offset, zone.sector_length);
+						changed_sectors++;
+					}
+				}
+			}
+		}
+	}
+
+	return true;
+}
+
+static bool n64dd_overlay_changed_physical_writable_to_flat(const std::vector<uint8_t>& physical,
+	const std::vector<uint8_t>& base_physical, uint8_t* flat, uint8_t disk_type, uint32_t& changed_sectors) {
+	if (physical.size() != N64DD_PHYSICAL_SIZE || base_physical.size() != N64DD_PHYSICAL_SIZE || disk_type >= 7) {
+		return false;
+	}
+
+	changed_sectors = 0;
+	for (uint32_t pzone = 0; pzone < 16; pzone++) {
+		if (!n64dd_pzone_is_writable(pzone, disk_type)) continue;
+
+		const auto& zone = N64DD_ZONES[pzone];
+		for (uint32_t zone_track = 0; zone_track < zone.tracks; zone_track++) {
+			const uint32_t track = zone.track_offset + zone_track;
+			for (uint32_t block = 0; block < 2; block++) {
+				const uint32_t physical_offset = n64dd_expanded_offset(track, zone.head, block);
+				const uint32_t flat_offset = n64dd_flat_offset(track, zone.head, block, 0);
+				const uint32_t physical_block_length = zone.sector_length * N64DD_SECTORS_PER_BLOCK;
+
+				if ((physical_offset + physical_block_length) > N64DD_PHYSICAL_SIZE) return false;
+				if ((flat_offset + N64DD_FLAT_BLOCK_STRIDE) > N64DD_EXPANDED_SIZE) return false;
+
+				for (uint32_t sector = 0; sector < N64DD_SECTORS_PER_BLOCK; sector++) {
+					const uint32_t physical_sector_offset = physical_offset + (sector * zone.sector_length);
+					const uint32_t flat_sector_offset = flat_offset + (sector * N64DD_FLAT_SECTOR_STRIDE);
+					if (memcmp(physical.data() + physical_sector_offset,
+						base_physical.data() + physical_sector_offset,
+						zone.sector_length)) {
+						memcpy(flat + flat_sector_offset, physical.data() + physical_sector_offset, zone.sector_length);
+						changed_sectors++;
+					}
+				}
+			}
+		}
+	}
+
+	return true;
+}
+
+static void n64dd_debug_boot_lba(uint32_t lba, uint64_t source_offset, uint32_t track, uint32_t head,
+	uint32_t block, uint32_t sector_length, bool bad_lba, const std::vector<uint8_t>& block_data) {
+	if (!N64DD_VERBOSE_LOG || lba >= 26) return;
+
+	const uint32_t flat_offset = n64dd_flat_offset(track, head, block, 0);
+	printf("64DD NDD boot LBA %02u: T%04u H%u B%u src 0x%08llx flat 0x%08x len %u %s first",
+		(unsigned)lba,
+		(unsigned)track,
+		(unsigned)head,
+		(unsigned)block,
+		(unsigned long long)source_offset,
+		(unsigned)flat_offset,
+		(unsigned)sector_length,
+		bad_lba ? "bad/C1" : "valid");
+
+	const uint32_t bytes_to_print = std::min<uint32_t>((uint32_t)block_data.size(), 8);
+	for (uint32_t i = 0; i < bytes_to_print; i++) {
+		printf(" %02x", block_data[i]);
+	}
+	printf("\n");
+}
+
+static bool n64dd_pack_expanded_ndd(fileTYPE* file, uint8_t* dest) {
+	std::vector<uint8_t> block_data;
+
+	for (uint32_t pzone = 0; pzone < 16; pzone++) {
+		const auto& zone = N64DD_ZONES[pzone];
+
+		for (uint32_t zone_track = 0; zone_track < zone.tracks; zone_track++) {
+			const uint32_t track = zone.track_offset + zone_track;
+
+			for (uint32_t block = 0; block < 2; block++) {
+				const uint32_t source_offset = n64dd_expanded_offset(track, zone.head, block);
+				if (!n64dd_copy_block_to_flat(file, source_offset, dest, track, zone.head, block, zone.sector_length, block_data)) {
+					return false;
+				}
+			}
+		}
+	}
+
+	return true;
+}
+
+static bool n64dd_repeat_check(const std::vector<uint8_t>& data, uint32_t repeat, uint32_t size) {
+	if (data.size() < repeat * size) return false;
+	for (uint32_t i = 0; i < size; i++) {
+		for (uint32_t j = 1; j < repeat; j++) {
+			if (data[i] != data[(j * size) + i]) return false;
+		}
+	}
+	return true;
+}
+
+static bool n64dd_valid_system_block(const std::vector<uint8_t>& block, uint32_t sector_length, bool dev) {
+	if (block.size() < N64DD_BLOCK_SIZE[0]) return false;
+
+	const bool retail_magic =
+		(block[0] == 0xE8 && block[1] == 0x48 && block[2] == 0xD3 && block[3] == 0x16) ||
+		(block[0] == 0x22 && block[1] == 0x63 && block[2] == 0xEE && block[3] == 0x56);
+	const bool dev_magic = block[0] == 0x00 && block[1] == 0x00 && block[2] == 0x00 && block[3] == 0x00;
+
+	if (dev ? !dev_magic : !retail_magic) return false;
+	if (block[4] != 0x10) return false;
+	if (block[5] < 0x10 || block[5] >= 0x17) return false;
+	if (block[0x18] != 0xFF || block[0x19] != 0xFF || block[0x1A] != 0xFF || block[0x1B] != 0xFF) return false;
+	if (block[0x1C] != 0x80) return false;
+
+	return n64dd_repeat_check(block, N64DD_SECTORS_PER_BLOCK, sector_length);
+}
+
+static bool n64dd_valid_id_block(fileTYPE* file, uint32_t lba, char* disk_id) {
+	std::vector<uint8_t> block(N64DD_BLOCK_SIZE[0]);
+	if (!n64dd_read_exact(file, (uint64_t)lba * N64DD_BLOCK_SIZE[0], block.data(), (uint32_t)block.size())) return false;
+	if (!n64dd_repeat_check(block, N64DD_SECTORS_PER_BLOCK, N64DD_SYSTEM_SECTOR_LENGTH)) return false;
+	if (disk_id && !disk_id[0]) {
+		memcpy(disk_id, block.data(), 4);
+		disk_id[4] = '\0';
+	}
+	return true;
+}
+
+static bool n64dd_read_disk_id(fileTYPE* file, char* disk_id) {
+	static constexpr uint8_t id_blocks[2] = {15, 14};
+	if (disk_id) disk_id[0] = '\0';
+
+	bool valid_id = false;
+	for (uint8_t id_block : id_blocks) {
+		if (n64dd_valid_id_block(file, id_block, disk_id)) valid_id = true;
+	}
+	return valid_id;
+}
+
+static bool n64dd_find_ndd_system_block(fileTYPE* file, std::vector<uint8_t>& sys_data, uint8_t& disk_type, std::vector<uint8_t>& bad_lbas, char* disk_id, bool verbose = true) {
+	static constexpr uint8_t retail_system_blocks[4] = {9, 8, 1, 0};
+	static constexpr uint8_t dev_system_blocks[4] = {11, 10, 3, 2};
+	static constexpr uint8_t retail_bad_blocks[13] = {2, 3, 10, 11, 12, 16, 17, 18, 19, 20, 21, 22, 23};
+	static constexpr uint8_t dev_bad_blocks[12] = {0, 1, 8, 9, 16, 17, 18, 19, 20, 21, 22, 23};
+	std::vector<uint8_t> block(N64DD_BLOCK_SIZE[0]);
+	std::vector<uint8_t> best_sys_data;
+	uint8_t best_disk_type = 0;
+	uint8_t best_system_block = 0;
+	bool found = false;
+	if (disk_id) disk_id[0] = '\0';
+
+	bad_lbas.assign(0x10DC, 0);
+	for (uint8_t system_block : retail_system_blocks) {
+		if (!n64dd_read_exact(file, (uint64_t)system_block * N64DD_BLOCK_SIZE[0], block.data(), (uint32_t)block.size())) {
+			return false;
+		}
+		if (n64dd_valid_system_block(block, N64DD_SYSTEM_SECTOR_LENGTH, false)) {
+			best_sys_data.assign(block.begin(), block.begin() + N64DD_SYSTEM_SECTOR_LENGTH);
+			best_disk_type = block[5] & 0x0F;
+			best_system_block = system_block;
+			found = true;
+		} else {
+			bad_lbas[system_block] = 1;
+		}
+	}
+	if (found) {
+		for (uint8_t lba : retail_bad_blocks) bad_lbas[lba] = 1;
+		if (!n64dd_read_disk_id(file, disk_id)) return false;
+
+		sys_data.swap(best_sys_data);
+		disk_type = best_disk_type;
+		if (verbose) {
+			printf("64DD NDD: retail system block %u, disk type %u.\n", (unsigned)best_system_block, (unsigned)disk_type);
+			if (disk_id && disk_id[0]) printf("64DD NDD: disk ID %.4s.\n", disk_id);
+			printf("64DD NDD: IPL load LBA blocks %u, load address 0x%08x.\n",
+				(unsigned)((sys_data[0x06] << 8) | sys_data[0x07]),
+				(unsigned)((sys_data[0x1C] << 24) | (sys_data[0x1D] << 16) | (sys_data[0x1E] << 8) | sys_data[0x1F]));
+		}
+		return disk_type < 7;
+	}
+
+	bad_lbas.assign(0x10DC, 0);
+	for (uint8_t system_block : dev_system_blocks) {
+		if (!n64dd_read_exact(file, (uint64_t)system_block * N64DD_BLOCK_SIZE[0], block.data(), (uint32_t)block.size())) {
+			return false;
+		}
+		if (n64dd_valid_system_block(block, 192, true)) {
+			best_sys_data.assign(block.begin(), block.begin() + N64DD_SYSTEM_SECTOR_LENGTH);
+			best_disk_type = block[5] & 0x0F;
+			best_system_block = system_block;
+			found = true;
+		} else {
+			bad_lbas[system_block] = 1;
+		}
+	}
+	if (found) {
+		for (uint8_t lba : dev_bad_blocks) bad_lbas[lba] = 1;
+		if (!n64dd_read_disk_id(file, disk_id)) return false;
+
+		sys_data.swap(best_sys_data);
+		disk_type = best_disk_type;
+		if (verbose) {
+			printf("64DD NDD: development system block %u, disk type %u.\n", (unsigned)best_system_block, (unsigned)disk_type);
+			if (disk_id && disk_id[0]) printf("64DD NDD: disk ID %.4s.\n", disk_id);
+			printf("64DD NDD: IPL load LBA blocks %u, load address 0x%08x.\n",
+				(unsigned)((sys_data[0x06] << 8) | sys_data[0x07]),
+				(unsigned)((sys_data[0x1C] << 24) | (sys_data[0x1D] << 16) | (sys_data[0x1E] << 8) | sys_data[0x1F]));
+		}
+		return disk_type < 7;
+	}
+
+	return false;
+}
+
+static bool n64dd_pack_compact_ndd_to_physical(fileTYPE* file, std::vector<uint8_t>& physical, uint8_t& disk_type, char* disk_id) {
+	if (file->size != N64DD_NDD_SIZE) return false;
+
+	std::vector<uint8_t> sys_data;
+	std::vector<uint8_t> bad_lbas;
+	if (!n64dd_find_ndd_system_block(file, sys_data, disk_type, bad_lbas, disk_id, false)) return false;
+
+	physical.assign(N64DD_PHYSICAL_SIZE, 0);
+
+	uint64_t source_offset = 0;
+	uint32_t vzone = 0;
+	std::vector<uint8_t> block_data;
+
+	for (uint32_t lba = 0; lba < 0x10DC; lba++) {
+		while (vzone < 15 && lba >= N64DD_VZONE_LBA[disk_type][vzone]) vzone++;
+
+		const uint32_t pzone = N64DD_VZONE_TO_PZONE[disk_type][vzone];
+		const uint32_t head = pzone > 7 ? 1 : 0;
+		const uint32_t block_size = N64DD_BLOCK_SIZE[pzone];
+		uint32_t lba_vzone = lba;
+		if (vzone > 0) lba_vzone -= N64DD_VZONE_LBA[disk_type][vzone - 1];
+
+		const uint32_t track_start = N64DD_ARES_TRACK_PHYSICAL[head ? pzone - 8 : pzone];
+		uint32_t track = N64DD_ARES_TRACK_PHYSICAL[pzone];
+		if (head) track -= lba_vzone >> 1;
+		else track += lba_vzone >> 1;
+
+		uint32_t defect_offset = pzone ? sys_data[0x08 + pzone - 1] : 0;
+		uint32_t defect_amount = sys_data[0x08 + pzone] - defect_offset;
+		while (defect_amount && ((uint32_t)sys_data[0x20 + defect_offset] + track_start) <= track) {
+			track++;
+			defect_offset++;
+			defect_amount--;
+		}
+
+		const uint32_t block = ((lba & 3) == 0 || (lba & 3) == 3) ? 0 : 1;
+		const uint32_t physical_offset = N64DD_ZONE_START[pzone] + ((track - track_start) * block_size * 2) + (block * block_size);
+		if ((physical_offset + block_size) > physical.size()) return false;
+
+		block_data.resize(block_size);
+		if (!n64dd_read_exact(file, source_offset, block_data.data(), block_size)) return false;
+		memcpy(physical.data() + physical_offset, block_data.data(), block_size);
+		source_offset += block_size;
+	}
+
+	return source_offset == (uint64_t)file->size;
+}
+
+static bool n64dd_expand_ndd_to_flat(fileTYPE* file, uint8_t* dest, bool& cart_expansion_disk, char* disk_id, uint8_t& disk_type, bool verbose = true) {
+	if (file->size != N64DD_NDD_SIZE) return false;
+
+	std::vector<uint8_t> sys_data;
+	std::vector<uint8_t> bad_lbas;
+	if (!n64dd_find_ndd_system_block(file, sys_data, disk_type, bad_lbas, disk_id, verbose)) return false;
+	cart_expansion_disk = disk_id && disk_id[0] == 'E';
+	if (verbose && cart_expansion_disk) {
+		printf("64DD NDD: cart expansion disk detected, IPL boot disabled.\n");
+	}
+
+	uint64_t source_offset = 0;
+	uint32_t lba = 0;
+	uint32_t starting_block = 0;
+	uint32_t marked_bad_blocks = 0;
+	std::vector<uint8_t> block_data;
+
+	for (uint32_t vzone = 0; vzone < 16; vzone++) {
+		const uint32_t pzone = N64DD_VZONE_TO_PZONE[disk_type][vzone];
+		const auto& zone = N64DD_ZONES[pzone];
+		const uint32_t block_size = zone.sector_length * N64DD_SECTORS_PER_BLOCK;
+		const uint32_t defect_start = pzone ? sys_data[0x07 + pzone] : 0;
+		const uint32_t defect_stop = sys_data[0x07 + pzone + 1];
+		uint32_t listed_bad_tracks = 0;
+		std::vector<uint8_t> bad_tracks(zone.tracks, 0);
+
+		for (uint32_t defect_offset = defect_start; defect_offset < defect_stop; defect_offset++) {
+			const uint32_t bad_track = sys_data[0x20 + defect_offset];
+			if (bad_track < zone.tracks) bad_tracks[bad_track] = 1;
+			listed_bad_tracks++;
+		}
+
+		for (uint32_t filler_track = 0; listed_bad_tracks < N64DD_BAD_TRACKS_PER_ZONE && filler_track < zone.tracks; filler_track++) {
+			bad_tracks[zone.tracks - 1 - filler_track] = 1;
+			listed_bad_tracks++;
+		}
+
+		for (uint32_t zone_track_index = 0; zone_track_index < zone.tracks; zone_track_index++) {
+			const uint32_t zone_track = zone.head ? (zone.tracks - 1 - zone_track_index) : zone_track_index;
+			const uint32_t track = zone.track_offset + zone_track;
+			if (bad_tracks[zone_track]) {
+				for (uint32_t block = 0; block < 2; block++) {
+					if (!n64dd_mark_bad_flat_block(dest, track, zone.head, block)) return false;
+					marked_bad_blocks++;
+				}
+				continue;
+			}
+
+			for (uint32_t block = 0; block < 2; block++) {
+				const uint32_t physical_block = starting_block ^ block;
+				if (lba >= bad_lbas.size()) return false;
+				if (!n64dd_copy_block_to_flat(file, source_offset, dest, track, zone.head, physical_block, zone.sector_length, block_data)) {
+					return false;
+				}
+				if (verbose) n64dd_debug_boot_lba(lba, source_offset, track, zone.head, physical_block, zone.sector_length, bad_lbas[lba] != 0, block_data);
+				if (bad_lbas[lba]) {
+					if (!n64dd_mark_bad_flat_block(dest, track, zone.head, physical_block)) return false;
+					marked_bad_blocks++;
+				}
+
+				source_offset += block_size;
+				lba++;
+			}
+			starting_block ^= 1;
+		}
+	}
+
+	if (verbose && N64DD_VERBOSE_LOG) {
+		printf("64DD NDD: SummerCart LBA map expanded %u blocks, marked %u bad/C1 blocks.\n", (unsigned)lba, (unsigned)marked_bad_blocks);
+	}
+	return lba == 0x10DC && source_offset == (uint64_t)file->size;
+}
+
+static bool n64dd_compact_lba_physical_offset(uint32_t lba, uint8_t disk_type, const std::vector<uint8_t>& sys_data,
+	uint32_t& physical_offset, uint32_t& block_size, uint8_t& pzone) {
+	if (disk_type >= 7 || lba >= 0x10DC || sys_data.size() < N64DD_SYSTEM_SECTOR_LENGTH) return false;
+
+	uint32_t vzone = 0;
+	while (vzone < 15 && lba >= N64DD_VZONE_LBA[disk_type][vzone]) vzone++;
+
+	pzone = N64DD_VZONE_TO_PZONE[disk_type][vzone];
+	const uint32_t head = pzone > 7 ? 1 : 0;
+	block_size = N64DD_BLOCK_SIZE[pzone];
+
+	uint32_t lba_vzone = lba;
+	if (vzone > 0) lba_vzone -= N64DD_VZONE_LBA[disk_type][vzone - 1];
+
+	const uint32_t track_start = N64DD_ARES_TRACK_PHYSICAL[head ? pzone - 8 : pzone];
+	uint32_t track = N64DD_ARES_TRACK_PHYSICAL[pzone];
+	if (head) track -= lba_vzone >> 1;
+	else track += lba_vzone >> 1;
+
+	uint32_t defect_offset = pzone ? sys_data[0x08 + pzone - 1] : 0;
+	uint32_t defect_amount = sys_data[0x08 + pzone] - defect_offset;
+	while (defect_amount && (0x20 + defect_offset) < sys_data.size() &&
+		((uint32_t)sys_data[0x20 + defect_offset] + track_start) <= track) {
+		track++;
+		defect_offset++;
+		defect_amount--;
+	}
+	if (defect_amount && (0x20 + defect_offset) >= sys_data.size()) return false;
+	if (track < track_start) return false;
+
+	const uint32_t block = ((lba & 3) == 0 || (lba & 3) == 3) ? 0 : 1;
+	physical_offset = N64DD_ZONE_START[pzone] + ((track - track_start) * block_size * 2) + (block * block_size);
+	return (physical_offset + block_size) <= N64DD_PHYSICAL_SIZE;
+}
+
+static bool n64dd_build_compact_ndd_sector_map(fileTYPE* file, uint8_t& disk_type, std::vector<n64dd_sector_map_entry>& map) {
+	if (file->size != N64DD_NDD_SIZE) return false;
+
+	std::vector<uint8_t> sys_data;
+	std::vector<uint8_t> bad_lbas;
+	if (!n64dd_find_ndd_system_block(file, sys_data, disk_type, bad_lbas, nullptr, false)) return false;
+
+	map.clear();
+	map.reserve(0x10DC * N64DD_SECTORS_PER_BLOCK);
+
+	uint32_t lba = 0;
+	uint32_t starting_block = 0;
+	uint32_t source_offset = 0;
+	for (uint32_t vzone = 0; vzone < 16; vzone++) {
+		const uint32_t pzone = N64DD_VZONE_TO_PZONE[disk_type][vzone];
+		const auto& zone = N64DD_ZONES[pzone];
+		const uint32_t source_block_size = zone.sector_length * N64DD_SECTORS_PER_BLOCK;
+		const uint32_t defect_start = pzone ? sys_data[0x07 + pzone] : 0;
+		const uint32_t defect_stop = sys_data[0x07 + pzone + 1];
+		uint32_t listed_bad_tracks = 0;
+		std::vector<uint8_t> bad_tracks(zone.tracks, 0);
+
+		for (uint32_t defect_offset = defect_start; defect_offset < defect_stop; defect_offset++) {
+			if ((0x20 + defect_offset) >= sys_data.size()) return false;
+			const uint32_t bad_track = sys_data[0x20 + defect_offset];
+			if (bad_track < zone.tracks) bad_tracks[bad_track] = 1;
+			listed_bad_tracks++;
+		}
+
+		for (uint32_t filler_track = 0; listed_bad_tracks < N64DD_BAD_TRACKS_PER_ZONE && filler_track < zone.tracks; filler_track++) {
+			bad_tracks[zone.tracks - 1 - filler_track] = 1;
+			listed_bad_tracks++;
+		}
+
+		for (uint32_t zone_track_index = 0; zone_track_index < zone.tracks; zone_track_index++) {
+			const uint32_t zone_track = zone.head ? (zone.tracks - 1 - zone_track_index) : zone_track_index;
+			const uint32_t track = zone.track_offset + zone_track;
+			if (bad_tracks[zone_track]) continue;
+
+			for (uint32_t block = 0; block < 2; block++) {
+				if (lba >= bad_lbas.size()) return false;
+
+				uint32_t physical_block_offset = 0;
+				uint32_t physical_block_size = 0;
+				uint8_t physical_pzone = 0;
+				if (!n64dd_compact_lba_physical_offset(lba, disk_type, sys_data,
+					physical_block_offset, physical_block_size, physical_pzone)) {
+					return false;
+				}
+
+				const uint32_t flat_block = starting_block ^ block;
+				if (physical_block_size != (zone.sector_length * N64DD_SECTORS_PER_BLOCK)) return false;
+
+				for (uint32_t sector = 0; sector < N64DD_SECTORS_PER_BLOCK; sector++) {
+					n64dd_sector_map_entry entry = {};
+					entry.flat_offset = n64dd_flat_offset(track, zone.head, flat_block, sector);
+					entry.physical_offset = physical_block_offset + (sector * zone.sector_length);
+					entry.source_offset = source_offset + (sector * zone.sector_length);
+					entry.sector_length = zone.sector_length;
+					entry.pzone = (uint8_t)pzone;
+					if ((entry.flat_offset + entry.sector_length) > N64DD_EXPANDED_SIZE) return false;
+					if ((entry.physical_offset + entry.sector_length) > N64DD_PHYSICAL_SIZE) return false;
+					if ((entry.source_offset + entry.sector_length) > N64DD_NDD_SIZE) return false;
+					map.push_back(entry);
+				}
+
+				source_offset += source_block_size;
+				lba++;
+			}
+			starting_block ^= 1;
+		}
+	}
+
+	return lba == 0x10DC && source_offset == N64DD_NDD_SIZE;
+}
+
+static bool n64dd_disk_source_is_compact_ndd(const char* disk_path, bool& compact_ndd) {
+	fileTYPE file = {};
+	if (!FileOpen(&file, disk_path, 1)) {
+		printf("64DD save: failed to reopen source disk \"%s\".\n", disk_path);
+		return false;
+	}
+
+	compact_ndd = file.size == N64DD_NDD_SIZE;
+	FileClose(&file);
+	return true;
+}
+
+static bool n64dd_stamp_compact_ndd_disk_id_flat(const char* disk_path, uint8_t* flat, uint8_t disk_type) {
+	if (!flat || disk_type >= 7) return false;
+
+	uint8_t stamp[8] = {};
+	n64dd_make_disk_id_stamp(disk_path, stamp);
+
+	static constexpr uint32_t DISK_ID_TRACK = 7;
+	static constexpr uint32_t DISK_ID_BLOCKS[2] = {1, 0};
+	for (uint32_t block_index = 0; block_index < 2; block_index++) {
+		for (uint32_t sector = 0; sector < N64DD_SECTORS_PER_BLOCK; sector++) {
+			const uint32_t offset = n64dd_flat_offset(DISK_ID_TRACK, 0, DISK_ID_BLOCKS[block_index], sector);
+			if ((offset + N64DD_SYSTEM_SECTOR_LENGTH) > N64DD_EXPANDED_SIZE) return false;
+			n64dd_stamp_disk_id_sector(flat + offset, stamp);
+		}
+	}
+
+	return true;
+}
+
+static bool n64dd_stamp_compact_ndd_disk_id_physical(const char* disk_path, std::vector<uint8_t>& physical, uint8_t disk_type) {
+	if (physical.size() != N64DD_PHYSICAL_SIZE || disk_type >= 7) return false;
+
+	uint8_t stamp[8] = {};
+	n64dd_make_disk_id_stamp(disk_path, stamp);
+
+	static constexpr uint32_t DISK_ID_LBAS[2] = {14, 15};
+	for (uint32_t lba_index = 0; lba_index < 2; lba_index++) {
+		const uint32_t lba = DISK_ID_LBAS[lba_index];
+		const uint32_t track = lba >> 1;
+		const uint32_t block = ((lba & 3) == 0 || (lba & 3) == 3) ? 0 : 1;
+		const uint32_t block_offset = N64DD_ZONE_START[0] + (track * N64DD_BLOCK_SIZE[0] * 2) + (block * N64DD_BLOCK_SIZE[0]);
+		if ((block_offset + N64DD_BLOCK_SIZE[0]) > physical.size()) return false;
+		for (uint32_t sector = 0; sector < N64DD_SECTORS_PER_BLOCK; sector++) {
+			const uint32_t offset = block_offset + (sector * N64DD_SYSTEM_SECTOR_LENGTH);
+			n64dd_stamp_disk_id_sector(physical.data() + offset, stamp);
+		}
+	}
+
+	return true;
+}
+
+static bool n64dd_overlay_changed_flat_compact_ndd_to_physical(const char* disk_path, const uint8_t* flat,
+	const uint8_t* original_flat, std::vector<uint8_t>& physical, uint8_t disk_type, uint32_t& changed_sectors) {
+	if (physical.size() != N64DD_PHYSICAL_SIZE || disk_type >= 7) return false;
+
+	fileTYPE file = {};
+	if (!FileOpen(&file, disk_path, 1)) {
+		printf("64DD save: failed to reopen source disk \"%s\".\n", disk_path);
+		return false;
+	}
+
+	uint8_t detected_disk_type = disk_type;
+	std::vector<n64dd_sector_map_entry> map;
+	const bool ok = n64dd_build_compact_ndd_sector_map(&file, detected_disk_type, map);
+	FileClose(&file);
+	if (!ok) return false;
+	if (detected_disk_type != disk_type) {
+		printf("64DD save: source disk type changed from %u to %u while building compact save map.\n",
+			(unsigned)disk_type,
+			(unsigned)detected_disk_type);
+	}
+
+	changed_sectors = 0;
+	for (const auto& entry : map) {
+		if (!n64dd_pzone_is_writable(entry.pzone, disk_type)) continue;
+		if (memcmp(flat + entry.flat_offset, original_flat + entry.flat_offset, entry.sector_length)) {
+			memcpy(physical.data() + entry.physical_offset, flat + entry.flat_offset, entry.sector_length);
+			changed_sectors++;
+		}
+	}
+
+	return true;
+}
+
+static bool n64dd_overlay_changed_physical_compact_ndd_to_flat(const char* disk_path,
+	const std::vector<uint8_t>& physical, const std::vector<uint8_t>& base_physical,
+	uint8_t* flat, uint8_t disk_type, uint32_t& changed_sectors) {
+	if (physical.size() != N64DD_PHYSICAL_SIZE || base_physical.size() != N64DD_PHYSICAL_SIZE || disk_type >= 7) {
+		return false;
+	}
+
+	fileTYPE file = {};
+	if (!FileOpen(&file, disk_path, 1)) {
+		printf("64DD save: failed to reopen source disk \"%s\".\n", disk_path);
+		return false;
+	}
+
+	uint8_t detected_disk_type = disk_type;
+	std::vector<n64dd_sector_map_entry> map;
+	const bool ok = n64dd_build_compact_ndd_sector_map(&file, detected_disk_type, map);
+	FileClose(&file);
+	if (!ok) return false;
+	if (detected_disk_type != disk_type) {
+		printf("64DD save: source disk type changed from %u to %u while building compact load map.\n",
+			(unsigned)disk_type,
+			(unsigned)detected_disk_type);
+	}
+
+	changed_sectors = 0;
+	for (const auto& entry : map) {
+		if (!n64dd_pzone_is_writable(entry.pzone, disk_type)) continue;
+		if (memcmp(physical.data() + entry.physical_offset,
+			base_physical.data() + entry.physical_offset,
+			entry.sector_length)) {
+			memcpy(flat + entry.flat_offset, physical.data() + entry.physical_offset, entry.sector_length);
+			changed_sectors++;
+		}
+	}
+
+	return true;
+}
+
+static bool n64dd_build_physical_base_image(const char* disk_path, uint8_t disk_type, std::vector<uint8_t>& physical) {
+	fileTYPE base_file = {};
+	if (!FileOpen(&base_file, disk_path, 1)) {
+		printf("64DD save: failed to reopen source disk \"%s\".\n", disk_path);
+		return false;
+	}
+
+	bool ok = false;
+	if (base_file.size == N64DD_PHYSICAL_SIZE) {
+		ok = n64dd_copy_file_to_vector(&base_file, physical, N64DD_PHYSICAL_SIZE, nullptr, nullptr);
+	} else if (base_file.size == N64DD_NDD_SIZE) {
+		uint8_t detected_disk_type = disk_type;
+		ok = n64dd_pack_compact_ndd_to_physical(&base_file, physical, detected_disk_type, nullptr);
+		if (ok) ok = n64dd_stamp_compact_ndd_disk_id_physical(disk_path, physical, detected_disk_type);
+		if (ok && detected_disk_type != disk_type) {
+			printf("64DD save: source disk type changed from %u to %u while building physical base.\n",
+				(unsigned)disk_type,
+				(unsigned)detected_disk_type);
+		}
+	} else {
+		printf("64DD save: unsupported source disk size %llu for \"%s\".\n",
+			(unsigned long long)base_file.size,
+			disk_path);
+	}
+
+	FileClose(&base_file);
+	return ok;
+}
+
+static bool n64dd_build_original_flat_image(const char* disk_path, uint8_t disk_type, std::vector<uint8_t>& original_flat) {
+	original_flat.assign(N64DD_EXPANDED_SIZE, 0);
+
+	fileTYPE base_file = {};
+	if (!FileOpen(&base_file, disk_path, 1)) {
+		printf("64DD save: failed to reopen source disk \"%s\".\n", disk_path);
+		return false;
+	}
+
+	bool ok = false;
+	if (base_file.size == N64DD_PHYSICAL_SIZE) {
+		ok = n64dd_pack_expanded_ndd(&base_file, original_flat.data());
+	} else if (base_file.size == N64DD_NDD_SIZE) {
+		bool cart_expansion_disk = false;
+		char disk_id[5] = {};
+		uint8_t detected_disk_type = disk_type;
+		ok = n64dd_expand_ndd_to_flat(&base_file, original_flat.data(), cart_expansion_disk, disk_id, detected_disk_type, false);
+		if (ok) ok = n64dd_stamp_compact_ndd_disk_id_flat(disk_path, original_flat.data(), detected_disk_type);
+		if (ok && detected_disk_type != disk_type) {
+			printf("64DD save: source disk type changed from %u to %u while building flat base.\n",
+				(unsigned)disk_type,
+				(unsigned)detected_disk_type);
+		}
+	} else {
+		printf("64DD save: unsupported source disk size %llu for \"%s\".\n",
+			(unsigned long long)base_file.size,
+			disk_path);
+	}
+
+	FileClose(&base_file);
+	return ok;
+}
+
+static bool n64dd_build_physical_save_image(const char* disk_path, const uint8_t* flat, uint8_t disk_type, std::vector<uint8_t>& physical) {
+	if (disk_type >= 7) {
+		printf("64DD save: unsupported disk type %u.\n", (unsigned)disk_type);
+		return false;
+	}
+
+	std::vector<uint8_t> original_flat;
+	if (!n64dd_build_physical_base_image(disk_path, disk_type, physical)) return false;
+	if (!n64dd_build_original_flat_image(disk_path, disk_type, original_flat)) return false;
+
+	bool compact_ndd = false;
+	if (!n64dd_disk_source_is_compact_ndd(disk_path, compact_ndd)) return false;
+
+	uint32_t changed_sectors = 0;
+	if (compact_ndd) {
+		if (N64DD_VERBOSE_LOG) printf("64DD save: using compact NDD LBA map for sidecar save.\n");
+		if (!n64dd_overlay_changed_flat_compact_ndd_to_physical(disk_path, flat, original_flat.data(), physical, disk_type, changed_sectors)) {
+			return false;
+		}
+	} else {
+		if (!n64dd_overlay_changed_flat_writable_to_physical(flat, original_flat.data(), physical, disk_type, changed_sectors)) {
+			return false;
+		}
+	}
+
+	if (N64DD_VERBOSE_LOG) printf("64DD save: detected %u changed writable sectors.\n", (unsigned)changed_sectors);
+	return true;
+}
+
+static bool n64dd_decode_flat_offset(uint32_t flat_offset, uint32_t& track, uint32_t& head, uint32_t& block, uint32_t& sector) {
+	if (flat_offset >= N64DD_EXPANDED_SIZE) return false;
+
+	head = flat_offset >= N64DD_FLAT_HEAD_STRIDE ? 1 : 0;
+	uint32_t offset = flat_offset - (head ? N64DD_FLAT_HEAD_STRIDE : 0);
+	track = offset / N64DD_FLAT_TRACK_STRIDE;
+	offset %= N64DD_FLAT_TRACK_STRIDE;
+	block = offset / N64DD_FLAT_BLOCK_STRIDE;
+	offset %= N64DD_FLAT_BLOCK_STRIDE;
+	sector = offset / N64DD_FLAT_SECTOR_STRIDE;
+
+	return track < N64DD_FLAT_TRACKS_PER_HEAD &&
+		block < 2 &&
+		sector < N64DD_SECTORS_PER_BLOCK &&
+		(offset % N64DD_FLAT_SECTOR_STRIDE) == 0;
+}
+
+static uint32_t n64dd_flat_zone_index(uint32_t track, uint32_t head) {
+	uint32_t zone = 0;
+	for (uint32_t i = 1; i < 8; i++) {
+		if (track >= N64DD_TRACK_BASE[i]) zone = i;
+	}
+	return head ? zone + 8 : zone;
+}
+
+static bool n64dd_compact_disk_id_sector(uint32_t flat_offset) {
+	uint32_t track = 0;
+	uint32_t head = 0;
+	uint32_t block = 0;
+	uint32_t sector = 0;
+	if (!n64dd_decode_flat_offset(flat_offset, track, head, block, sector)) return false;
+	return track == 7 && head == 0 && (block == 0 || block == 1);
+}
+
+static bool n64dd_read_original_flat_sector(fileTYPE* base_file, bool compact_ndd,
+	const std::vector<n64dd_sector_map_entry>& compact_map, const uint8_t disk_id_stamp[8],
+	uint32_t flat_offset, uint8_t original_sector[N64DD_FLAT_SECTOR_STRIDE]) {
+	memset(original_sector, 0, N64DD_FLAT_SECTOR_STRIDE);
+
+	uint32_t source_offset = 0;
+	uint32_t sector_length = 0;
+	if (compact_ndd) {
+		const auto entry = std::lower_bound(compact_map.begin(), compact_map.end(), flat_offset,
+			[](const n64dd_sector_map_entry& item, uint32_t value) { return item.flat_offset < value; });
+		if (entry == compact_map.end() || entry->flat_offset != flat_offset) return false;
+		source_offset = entry->source_offset;
+		sector_length = entry->sector_length;
+	} else {
+		uint32_t track = 0;
+		uint32_t head = 0;
+		uint32_t block = 0;
+		uint32_t sector = 0;
+		if (!n64dd_decode_flat_offset(flat_offset, track, head, block, sector)) return false;
+		const uint32_t zone = n64dd_flat_zone_index(track, head);
+		sector_length = N64DD_ZONES[zone].sector_length;
+		source_offset = n64dd_expanded_offset(track, head, block) + (sector * sector_length);
+	}
+
+	if ((uint64_t)source_offset + sector_length > (uint64_t)base_file->size) return false;
+	if (!n64dd_read_exact(base_file, source_offset, original_sector, sector_length)) return false;
+	if (compact_ndd && n64dd_compact_disk_id_sector(flat_offset)) {
+		n64dd_stamp_disk_id_sector(original_sector, disk_id_stamp);
+	}
+	return true;
+}
+
+static bool n64dd_update_flat_save_entries_from_dirty_blocks(const char* disk_path, const uint8_t* flat,
+	uint8_t disk_type, const std::vector<uint32_t>& dirty_blocks, std::vector<n64dd_flat_save_entry>& entries) {
+	fileTYPE base_file = {};
+	if (!FileOpen(&base_file, disk_path, 1)) {
+		printf("64DD save: failed to reopen source disk \"%s\".\n", disk_path);
+		return false;
+	}
+
+	const bool compact_ndd = base_file.size == N64DD_NDD_SIZE;
+	if (!compact_ndd && base_file.size != N64DD_PHYSICAL_SIZE) {
+		printf("64DD save: unsupported source disk size %llu for \"%s\".\n",
+			(unsigned long long)base_file.size,
+			disk_path);
+		FileClose(&base_file);
+		return false;
+	}
+
+	std::vector<n64dd_sector_map_entry> compact_map;
+	uint8_t detected_disk_type = disk_type;
+	if (compact_ndd) {
+		if (!n64dd_build_compact_ndd_sector_map(&base_file, detected_disk_type, compact_map)) {
+			FileClose(&base_file);
+			return false;
+		}
+		if (detected_disk_type != disk_type) {
+			printf("64DD save: source disk type changed from %u to %u while building compact dirty map.\n",
+				(unsigned)disk_type,
+				(unsigned)detected_disk_type);
+		}
+		std::sort(compact_map.begin(), compact_map.end(),
+			[](const n64dd_sector_map_entry& a, const n64dd_sector_map_entry& b) { return a.flat_offset < b.flat_offset; });
+	}
+
+	uint8_t disk_id_stamp[8] = {};
+	if (compact_ndd) n64dd_make_disk_id_stamp(disk_path, disk_id_stamp);
+
+	uint8_t original_sector[N64DD_FLAT_SECTOR_STRIDE];
+	for (uint32_t block_offset : dirty_blocks) {
+		for (uint32_t sector = 0; sector < N64DD_SECTORS_PER_BLOCK; sector++) {
+			const uint32_t flat_offset = block_offset + (sector * N64DD_FLAT_SECTOR_STRIDE);
+			if ((flat_offset + N64DD_FLAT_SECTOR_STRIDE) > N64DD_EXPANDED_SIZE) {
+				FileClose(&base_file);
+				return false;
+			}
+			if (!n64dd_read_original_flat_sector(&base_file, compact_ndd, compact_map, disk_id_stamp,
+				flat_offset, original_sector)) {
+				FileClose(&base_file);
+				return false;
+			}
+			if (memcmp(flat + flat_offset, original_sector, N64DD_FLAT_SECTOR_STRIDE)) {
+				n64dd_update_flat_save_entry(entries, flat_offset, flat + flat_offset);
+			} else {
+				n64dd_remove_flat_save_entry(entries, flat_offset);
+			}
+		}
+	}
+
+	FileClose(&base_file);
+	return true;
+}
+
+static bool n64dd_update_flat_save_entries_from_all_sectors(const uint8_t* flat, const uint8_t* original_flat,
+	std::vector<n64dd_flat_save_entry>& entries) {
+	for (uint32_t head = 0; head < 2; head++) {
+		for (uint32_t track = 0; track < N64DD_FLAT_TRACKS_PER_HEAD; track++) {
+			for (uint32_t block = 0; block < 2; block++) {
+				for (uint32_t sector = 0; sector < N64DD_SECTORS_PER_BLOCK; sector++) {
+					const uint32_t flat_offset = n64dd_flat_offset(track, head, block, sector);
+					if ((flat_offset + N64DD_FLAT_SECTOR_STRIDE) > N64DD_EXPANDED_SIZE) return false;
+					if (memcmp(flat + flat_offset, original_flat + flat_offset, N64DD_FLAT_SECTOR_STRIDE)) {
+						n64dd_update_flat_save_entry(entries, flat_offset, flat + flat_offset);
+					} else {
+						n64dd_remove_flat_save_entry(entries, flat_offset);
+					}
+				}
+			}
+		}
+	}
+
+	return true;
+}
+
+static bool n64dd_build_flat_save_patch(const char* save_path, const char* physical_save_path,
+	const char* disk_path, const uint8_t* flat, uint8_t disk_type, std::vector<uint8_t>& patch,
+	uint32_t& changed_sectors, std::vector<uint32_t>& dirty_blocks, bool& needs_write) {
+	if (disk_type >= 7) {
+		printf("64DD flat save: unsupported disk type %u.\n", (unsigned)disk_type);
+		return false;
+	}
+
+	changed_sectors = 0;
+	needs_write = false;
+	if (!n64dd_find_dirty_flat_blocks(flat, dirty_blocks)) return false;
+	if (dirty_blocks.empty()) return true;
+
+	std::vector<n64dd_flat_save_entry> entries;
+	if (!n64dd_read_flat_save_entries(save_path, entries)) return false;
+
+	if (!FileExists(save_path, 0) && n64dd_physical_save_exists(physical_save_path)) {
+		std::vector<uint8_t> original_flat;
+		if (!n64dd_build_original_flat_image(disk_path, disk_type, original_flat)) return false;
+		if (!n64dd_update_flat_save_entries_from_all_sectors(flat, original_flat.data(), entries)) return false;
+	} else {
+		if (!n64dd_update_flat_save_entries_from_dirty_blocks(disk_path, flat, disk_type, dirty_blocks, entries)) {
+			std::vector<uint8_t> original_flat;
+			if (!n64dd_build_original_flat_image(disk_path, disk_type, original_flat)) return false;
+			if (!n64dd_update_flat_save_entries_from_all_sectors(flat, original_flat.data(), entries)) return false;
+		}
+	}
+
+	n64dd_build_flat_save_vector(patch, entries, disk_type);
+	changed_sectors = (uint32_t)entries.size();
+	needs_write = true;
+	return true;
+}
+
+static bool n64dd_save_flat_patch(const char* save_path, const char* physical_save_path, const char* disk_path,
+	uint8_t* mem, uint8_t disk_type, bool force) {
+	(void)force;
+	std::vector<uint8_t> patch;
+	uint32_t changed_sectors = 0;
+	std::vector<uint32_t> dirty_blocks;
+	bool needs_write = false;
+	if (!n64dd_build_flat_save_patch(save_path, physical_save_path, disk_path, mem, disk_type,
+		patch, changed_sectors, dirty_blocks, needs_write)) return false;
+
+	if (!needs_write) {
+		return true;
+	}
+
+	if (n64dd_file_matches_vector(save_path, patch)) {
+		n64dd_clear_dirty_flat_blocks(mem, dirty_blocks);
+		return true;
+	}
+
+	diskled_on();
+	menu_process_save();
+	if (!n64dd_write_vector_to_file(save_path, patch)) return false;
+
+	n64dd_clear_dirty_flat_blocks(mem, dirty_blocks);
+	printf("Saved 64DD disk writes to \"%s\" (%u saved sectors, %u dirty blocks).\n",
+		save_path,
+		(unsigned)changed_sectors,
+		(unsigned)dirty_blocks.size());
+	return true;
+}
+
+static bool n64dd_physical_save_needs_update(const char* save_path, const std::vector<uint8_t>& physical) {
+	if (!FileExists(save_path, 0)) return true;
+
+	fileTYPE save_file = {};
+	if (!FileOpenEx(&save_file, save_path, O_RDONLY, 0, 0)) return true;
+
+	if ((uint64_t)save_file.size != N64DD_PHYSICAL_SIZE) {
+		FileClose(&save_file);
+		return true;
+	}
+
+	static std::vector<uint8_t> existing;
+	existing.resize(N64DD_SAVE_CHUNK_SIZE);
+
+	uint32_t checked = 0;
+	while (checked < N64DD_PHYSICAL_SIZE) {
+		const uint32_t chunk = std::min<uint32_t>(N64DD_SAVE_CHUNK_SIZE, N64DD_PHYSICAL_SIZE - checked);
+		const int read = FileReadAdv(&save_file, existing.data(), (int)chunk);
+		if (read < 0 || static_cast<uint32_t>(read) != chunk || memcmp(existing.data(), physical.data() + checked, chunk)) {
+			FileClose(&save_file);
+			return true;
+		}
+		checked += chunk;
+	}
+
+	FileClose(&save_file);
+	return false;
+}
+
+static bool n64dd_save_disk_image(const char* save_path, const char* disk_path, uint8_t* mem, uint8_t disk_type, bool force) {
+	std::vector<uint8_t> physical;
+	if (!n64dd_build_physical_save_image(disk_path, mem, disk_type, physical)) {
+		return false;
+	}
+
+	if (!n64dd_physical_save_needs_update(save_path, physical)) {
+		if (force) printf("64DD save \"%s\" is already up to date.\n", save_path);
+		return true;
+	}
+
+	diskled_on();
+	menu_process_save();
+	if (!n64dd_write_vector_to_file(save_path, physical)) {
+		return false;
+	}
+
+	printf("Saved 64DD Ares-style disk image to \"%s\" (%u bytes).\n",
+		save_path,
+		(unsigned)physical.size());
+	return true;
+}
+
+static bool n64dd_load_flat_save_to_mem(const char* save_path, uint8_t* mem) {
+	if (!FileExists(save_path, 0)) return false;
+
+	fileTYPE save_file = {};
+	if (!FileOpenEx(&save_file, save_path, O_RDONLY, 0, 0)) {
+		printf("64DD flat save: failed to open \"%s\".\n", save_path);
+		return false;
+	}
+
+	if ((uint64_t)save_file.size < N64DD_FLAT_SAVE_HEADER_SIZE ||
+		((uint64_t)save_file.size - N64DD_FLAT_SAVE_HEADER_SIZE) % N64DD_FLAT_SAVE_ENTRY_SIZE) {
+		printf("64DD flat save: ignoring \"%s\" with invalid size %llu bytes.\n",
+			save_path,
+			(unsigned long long)save_file.size);
+		FileClose(&save_file);
+		return false;
+	}
+
+	std::vector<uint8_t> patch;
+	const uint32_t patch_size = (uint32_t)save_file.size;
+	const bool read_ok = n64dd_copy_file_to_vector(&save_file, patch, patch_size, "Loading 64DD flat save", save_path);
+	FileClose(&save_file);
+	if (!read_ok) {
+		printf("64DD flat save: failed reading \"%s\".\n", save_path);
+		return false;
+	}
+
+	if (memcmp(patch.data(), N64DD_FLAT_SAVE_MAGIC, sizeof(N64DD_FLAT_SAVE_MAGIC))) {
+		printf("64DD flat save: ignoring \"%s\" with unknown magic.\n", save_path);
+		return false;
+	}
+
+	const uint32_t expanded_size = n64dd_read_u32(patch.data() + 8);
+	const uint32_t sector_stride = n64dd_read_u32(patch.data() + 12);
+	const uint32_t changed_sectors = n64dd_read_u32(patch.data() + 20);
+	const uint32_t actual_sectors = (patch_size - N64DD_FLAT_SAVE_HEADER_SIZE) / N64DD_FLAT_SAVE_ENTRY_SIZE;
+	if (expanded_size != N64DD_EXPANDED_SIZE || sector_stride != N64DD_FLAT_SECTOR_STRIDE || changed_sectors != actual_sectors) {
+		printf("64DD flat save: ignoring \"%s\" with incompatible header.\n", save_path);
+		return false;
+	}
+
+	const uint8_t* entry = patch.data() + N64DD_FLAT_SAVE_HEADER_SIZE;
+	for (uint32_t sector = 0; sector < changed_sectors; sector++) {
+		const uint32_t flat_offset = n64dd_read_u32(entry);
+		entry += 4;
+		if ((flat_offset + N64DD_FLAT_SECTOR_STRIDE) > N64DD_EXPANDED_SIZE) {
+			printf("64DD flat save: ignoring \"%s\" with out-of-range sector 0x%08x.\n", save_path, flat_offset);
+			return false;
+		}
+		memcpy(mem + flat_offset, entry, N64DD_FLAT_SECTOR_STRIDE);
+		entry += N64DD_FLAT_SECTOR_STRIDE;
+	}
+
+	printf("Loaded 64DD flat disk save \"%s\" (%u changed flat sectors).\n",
+		save_path,
+		(unsigned)changed_sectors);
+	return true;
+}
+
+static bool n64dd_load_save_to_mem(const char* save_path, const char* disk_path, uint8_t* mem, uint8_t disk_type) {
+	if (!FileExists(save_path, 0)) return false;
+
+	fileTYPE save_file = {};
+	if (!FileOpenEx(&save_file, save_path, O_RDONLY, 0, 0)) {
+		printf("64DD save: failed to open \"%s\".\n", save_path);
+		return false;
+	}
+
+	if ((uint64_t)save_file.size != N64DD_PHYSICAL_SIZE) {
+		printf("64DD save: ignoring \"%s\" with unexpected size %llu bytes, expected Ares-style %u-byte .disk image.\n",
+			save_path,
+			(unsigned long long)save_file.size,
+			(unsigned)N64DD_PHYSICAL_SIZE);
+		FileClose(&save_file);
+		return false;
+	}
+
+	std::vector<uint8_t> physical;
+	const bool read_ok = n64dd_copy_file_to_vector(&save_file, physical, N64DD_PHYSICAL_SIZE, "Loading 64DD save", save_path);
+	FileClose(&save_file);
+	if (!read_ok) {
+		printf("64DD save: failed reading \"%s\".\n", save_path);
+		return false;
+	}
+
+	std::vector<uint8_t> base_physical;
+	if (!n64dd_build_physical_base_image(disk_path, disk_type, base_physical)) {
+		printf("64DD save: failed to rebuild source disk base for \"%s\".\n", save_path);
+		return false;
+	}
+
+	bool compact_ndd = false;
+	if (!n64dd_disk_source_is_compact_ndd(disk_path, compact_ndd)) return false;
+
+	uint32_t changed_sectors = 0;
+	if (compact_ndd) {
+		if (N64DD_VERBOSE_LOG) printf("64DD save: using compact NDD LBA map for sidecar load.\n");
+		if (!n64dd_overlay_changed_physical_compact_ndd_to_flat(disk_path, physical, base_physical, mem, disk_type, changed_sectors)) {
+			printf("64DD save: failed to overlay changed compact-NDD sectors from \"%s\".\n", save_path);
+			return false;
+		}
+	} else {
+		if (!n64dd_overlay_changed_physical_writable_to_flat(physical, base_physical, mem, disk_type, changed_sectors)) {
+			printf("64DD save: failed to overlay changed writable sectors from \"%s\".\n", save_path);
+			return false;
+		}
+	}
+
+	printf("Loaded 64DD disk save \"%s\" (%u changed writable sectors).\n", save_path, (unsigned)changed_sectors);
+	return true;
+}
+
+static int n64_dd_ipl_tx(fileTYPE* file, const char* name, const unsigned char idx, const uint32_t load_addr) {
+	uint32_t data_size = file->size;
+	const bool boot_ipl = ((idx & 0x3f) == 4);
+
+	if (!load_addr) {
+		printf("64DD IPL loading requires a DDRAM load address.\n");
+		FileClose(file);
+		return 0;
+	}
+
+	if (data_size > N64DD_IPL_SIZE) {
+		printf("64DD IPL file is too large: %u bytes, max %u bytes.\n", data_size, N64DD_IPL_SIZE);
+		FileClose(file);
+		return 0;
+	}
+	if (data_size < 4096) {
+		printf("64DD IPL file is too small: %u bytes.\n", data_size);
+		FileClose(file);
+		return 0;
+	}
+
+	printf("Loading 64DD IPL \"%s\" to DDRAM at 0x%08x%s.\n",
+		name,
+		load_addr,
+		boot_ipl ? " and staging it for boot" : "");
+	user_io_set_index(idx);
+	user_io_set_download(1, N64DD_IPL_SIZE);
+	ProgressMessage();
+
+	uint8_t* ddipl_mem = (uint8_t*)shmem_map(fpga_mem(load_addr), N64DD_IPL_SIZE);
+	uint8_t* boot_mem = boot_ipl ? (uint8_t*)shmem_map(fpga_mem(N64_ROM_FASTLOAD_ADDR), N64DD_IPL_SIZE) : nullptr;
+
+	if (!ddipl_mem || ddipl_mem == (uint8_t*)-1 || (boot_ipl && (!boot_mem || boot_mem == (uint8_t*)-1))) {
+		if (ddipl_mem && ddipl_mem != (uint8_t*)-1) shmem_unmap(ddipl_mem, N64DD_IPL_SIZE);
+		if (boot_mem && boot_mem != (uint8_t*)-1) shmem_unmap(boot_mem, N64DD_IPL_SIZE);
+		user_io_set_download(0);
+		FileClose(file);
+		printf("Failed to map 64DD IPL DDRAM buffers.\n");
+		return 0;
+	}
+
+	memset(ddipl_mem, 0, N64DD_IPL_SIZE);
+	if (boot_mem) memset(boot_mem, 0, N64DD_IPL_SIZE);
+	bool ok = n64dd_copy_ipl_to_mem(file, name, ddipl_mem, boot_mem, data_size);
+
+	shmem_unmap(ddipl_mem, N64DD_IPL_SIZE);
+	if (boot_mem) shmem_unmap(boot_mem, N64DD_IPL_SIZE);
+	FileClose(file);
+
+	user_io_set_download(0);
+	ProgressMessage();
+
+	if (!ok) {
+		printf("Failed to load 64DD IPL \"%s\".\n", name);
+		return 0;
+	}
+
+	if (boot_ipl) {
+		strcpy(current_rom_path, name);
+		loaded = 1;
+	}
+
+	printf("Done loading 64DD IPL.\n");
+	return 1;
+}
+
+static bool n64dd_open_boot_ipl(fileTYPE* file, const char* disk_path, char* boot_path, size_t boot_path_size) {
+	const char* slash = strrchr(disk_path, '/');
+	const char* backslash = strrchr(disk_path, '\\');
+	if (backslash && (!slash || backslash > slash)) slash = backslash;
+
+	if (slash) {
+		const size_t dir_len = slash - disk_path;
+		if (dir_len + strlen("/") + strlen(N64DD_IPL_BOOT_FILE) < boot_path_size) {
+			snprintf(boot_path, boot_path_size, "%.*s/%s", (int)dir_len, disk_path, N64DD_IPL_BOOT_FILE);
+			if (FileOpen(file, boot_path, 1)) return true;
+		}
+	}
+
+	snprintf(boot_path, boot_path_size, "%s/%s", HomeDir(), N64DD_IPL_BOOT_FILE);
+	return FileOpen(file, boot_path, 1);
+}
+
+static int n64dd_autoload_ipl(const char* disk_path, bool boot_ipl) {
+	fileTYPE ipl_file = {};
+	char boot_path[1024];
+
+	if (!n64dd_open_boot_ipl(&ipl_file, disk_path, boot_path, sizeof(boot_path))) {
+		printf("64DD IPL autoload: %s not found.\n", N64DD_IPL_BOOT_FILE);
+		return 1;
+	}
+
+	printf("64DD IPL autoload: %s \"%s\".\n",
+		boot_ipl ? "booting" : "preloading IPL ROM for cart expansion from",
+		boot_path);
+	if (boot_ipl) unmount_all_saves();
+	return n64_dd_ipl_tx(&ipl_file, boot_path, boot_ipl ? 4 : 5, N64DD_IPL_LOAD_ADDR);
+}
+
+static int n64_dd_disk_tx(fileTYPE* file, const char* name, const unsigned char idx, const uint32_t load_addr) {
+	if (!load_addr) {
+		printf("64DD disk loading requires a DDRAM load address.\n");
+		FileClose(file);
+		return 0;
+	}
+
+	n64dd_flush_pending_save_before_disk_change();
+	n64dd_clear_disk_save_state();
+
+	char disk_save_path[1024] = {};
+	char flat_save_path[1024] = {};
+	n64dd_create_save_path(disk_save_path, name);
+	n64dd_create_flat_save_path(flat_save_path, name);
+
+	if (FileExists(disk_save_path, 0)) {
+		fileTYPE sidecar_disk_file = {};
+		if (FileOpenEx(&sidecar_disk_file, disk_save_path, O_RDONLY, 0, 0)) {
+			if (sidecar_disk_file.size == N64DD_PHYSICAL_SIZE) {
+				if (N64DD_VERBOSE_LOG) {
+					printf("64DD disk loader: Ares-style .disk sidecar will be overlaid after base geometry expansion.\n");
+				}
+			} else if (N64DD_VERBOSE_LOG) {
+				printf("64DD disk loader: ignoring sidecar \"%s\" with unexpected size %llu bytes.\n",
+					disk_save_path,
+					(unsigned long long)sidecar_disk_file.size);
+			}
+			FileClose(&sidecar_disk_file);
+		} else {
+			printf("64DD disk loader: failed to open sidecar \"%s\".\n", disk_save_path);
+		}
+	}
+
+	printf("Loading 64DD disk \"%s\" to DDRAM at 0x%08x.\n", name, load_addr);
+	user_io_set_index(idx);
+	user_io_set_download(1, N64DD_EXPANDED_SIZE);
+	ProgressMessage();
+
+	uint8_t* mem = (uint8_t*)shmem_map(fpga_mem(load_addr), N64DD_EXPANDED_SIZE);
+	if (!mem || mem == (uint8_t*)-1) {
+		user_io_set_download(0);
+		FileClose(file);
+		printf("Failed to map DDRAM for 64DD disk load.\n");
+		return 0;
+	}
+
+	memset(mem, 0, N64DD_EXPANDED_SIZE);
+	bool ok = false;
+	bool cart_expansion_disk = false;
+	uint8_t disk_type = 0;
+	char disk_id[5] = {};
+	if (file->size == N64DD_PHYSICAL_SIZE) {
+		printf("64DD disk loader: physical/MAME image, expanding to flat DDR layout (%u bytes).\n", N64DD_EXPANDED_SIZE);
+		std::vector<uint8_t> sys_data;
+		std::vector<uint8_t> bad_lbas;
+		if (n64dd_find_ndd_system_block(file, sys_data, disk_type, bad_lbas, disk_id)) {
+			printf("64DD disk: disk ID %.4s.\n", disk_id);
+			cart_expansion_disk = disk_id[0] == 'E';
+		} else if (n64dd_read_disk_id(file, disk_id)) {
+			printf("64DD disk: disk ID %.4s, disk type unknown.\n", disk_id);
+			cart_expansion_disk = disk_id[0] == 'E';
+		}
+		ok = n64dd_pack_expanded_ndd(file, mem);
+	} else if (file->size == N64DD_NDD_SIZE) {
+		printf("64DD disk loader: compact NDD image, expanding to flat DDR layout (%u bytes).\n", N64DD_EXPANDED_SIZE);
+		ok = n64dd_expand_ndd_to_flat(file, mem, cart_expansion_disk, disk_id, disk_type);
+		if (ok) {
+			ok = n64dd_stamp_compact_ndd_disk_id_flat(name, mem, disk_type);
+			if (ok && N64DD_VERBOSE_LOG) printf("64DD NDD: applied deterministic MiSTer disk ID stamp.\n");
+		}
+	} else {
+		printf("Unsupported 64DD disk image size: %llu bytes.\n", (unsigned long long)file->size);
+	}
+
+	if (ok) {
+		if (cart_expansion_disk) {
+			printf("64DD disk: cart expansion disk detected, IPL boot disabled.\n");
+		}
+		strncpy(current_dd_save_path, disk_save_path, sizeof(current_dd_save_path) - 1);
+		current_dd_save_path[sizeof(current_dd_save_path) - 1] = '\0';
+		strncpy(current_dd_flat_save_path, flat_save_path, sizeof(current_dd_flat_save_path) - 1);
+		current_dd_flat_save_path[sizeof(current_dd_flat_save_path) - 1] = '\0';
+		if (!n64dd_load_flat_save_to_mem(current_dd_flat_save_path, mem)) {
+			n64dd_load_save_to_mem(current_dd_save_path, name, mem, disk_type);
+		}
+	}
+
+	shmem_unmap(mem, N64DD_EXPANDED_SIZE);
+	FileClose(file);
+
+	user_io_set_download(0);
+	ProgressMessage();
+
+	if (!ok) {
+		printf("Failed to load 64DD disk image \"%s\".\n", name);
+		return 0;
+	}
+
+	strncpy(current_dd_disk_path, name, sizeof(current_dd_disk_path) - 1);
+	current_dd_disk_path[sizeof(current_dd_disk_path) - 1] = '\0';
+	current_dd_load_addr = load_addr;
+	current_dd_disk_loaded = 1;
+	current_dd_skip_initial_osd_save = user_io_osd_is_visible() ? 1 : 0;
+	current_dd_cart_expansion = cart_expansion_disk ? 1 : 0;
+	current_dd_disk_type = disk_type;
+	strncpy(current_dd_disk_id, disk_id, sizeof(current_dd_disk_id) - 1);
+	current_dd_disk_id[sizeof(current_dd_disk_id) - 1] = '\0';
+	printf("Done loading 64DD disk image.\n");
+	return n64dd_autoload_ipl(name, !current_dd_cart_expansion);
 }
 
 int n64_rom_tx(const char* name, const unsigned char idx, const uint32_t load_addr, uint32_t& file_crc) {
@@ -1497,34 +3363,42 @@ int n64_rom_tx(const char* name, const unsigned char idx, const uint32_t load_ad
 
 	printf("N64 file \"%s\" with %u bytes to send for index %02x.\n", name, data_size, idx);
 
-	unmount_all_saves();
-
-	// Set index byte
-	user_io_set_index(idx);
+	if (((idx & 0x3f) == 3) && data_size) {
+		file_crc = 0;
+		return n64_dd_disk_tx(&f, name, idx, load_addr);
+	}
+	if (((idx & 0x3f) == 4) && data_size) {
+		file_crc = 0;
+		unmount_all_saves();
+		return n64_dd_ipl_tx(&f, name, idx, load_addr);
+	}
 
 	if (((idx & 0x3f) == 2) && data_size) {
-		// Handle non-N64 files (Game Boy)
-
+		// Handle non-N64 files (Game Boy) for Transfer Pak.
+		const bool gb_changed = !(*current_rom_path_gb) || strcmp(current_rom_path_gb, name);
 		bool should_reset = false;
+		file_crc = 0;
 
-		if (!(*current_rom_path_gb) || strcmp(current_rom_path_gb, name)) {
-			strcpy(current_rom_path_gb, name);
-			if (*current_rom_path && user_io_status_get(TPAK_OPT)) {
-				mount_all_saves();
+		if (gb_changed) strcpy(current_rom_path_gb, name);
 
-				// Force reload of backup RAM
+		unmount_all_saves();
+		user_io_set_index(idx);
+
+		if (*current_rom_path && user_io_status_get(TPAK_OPT)) {
+			mount_all_saves();
+
+			if (gb_changed) {
+				// Force reload of backup RAM after switching the mounted Game Boy save.
 				user_io_status_set(RELOAD_SAVE_OPT, 1);
 				usleep(100000);
 				user_io_status_set(RELOAD_SAVE_OPT, 0);
 
-				// Hold reset
+				// Hold reset while the new Game Boy ROM is streamed.
 				user_io_status_set(RESET_OPT, 1);
-
 				should_reset = true;
 			}
 		}
 
-		// Prepare transmission of Game Boy file
 		user_io_set_download(1);
 		ProgressMessage();
 
@@ -1541,17 +3415,30 @@ int n64_rom_tx(const char* name, const unsigned char idx, const uint32_t load_ad
 		printf("Done loading Game Boy ROM.\n");
 		FileClose(&f);
 
-		// Signal end of transmission
 		user_io_set_download(0);
 		ProgressMessage();
 
 		if (should_reset) {
-			// Release reset
 			user_io_status_set(RESET_OPT, 0);
 		}
 
 		return 1;
 	}
+
+	const uint8_t dd_disk_was_loaded = current_dd_disk_loaded;
+	const uint8_t dd_disk_was_cart_expansion = current_dd_cart_expansion;
+	const char dd_disk_was_id[5] = {
+		current_dd_disk_id[0],
+		current_dd_disk_id[1],
+		current_dd_disk_id[2],
+		current_dd_disk_id[3],
+		'\0'
+	};
+	n64dd_flush_pending_save_before_disk_change();
+	unmount_all_saves();
+
+	// Set index byte
+	user_io_set_index(idx);
 
 	loaded = 0;
 
@@ -1743,6 +3630,22 @@ int n64_rom_tx(const char* name, const unsigned char idx, const uint32_t load_ad
 	}
 
 	strcpy(current_rom_path, name);
+
+	const bool dd_disk_matches_cart =
+		dd_disk_was_id[0] &&
+		cart_id[0] &&
+		!memcmp(dd_disk_was_id + 1, cart_id + 1, 3);
+	const bool preserve_dd_disk =
+		dd_disk_was_loaded &&
+		(cart_id[0] == 'C' || (dd_disk_was_cart_expansion && dd_disk_matches_cart));
+	if (preserve_dd_disk) {
+		printf("64DD cart expansion: preserving loaded disk %.4s for cart ID %.4s.\n", dd_disk_was_id, cart_id);
+	} else {
+		if (dd_disk_was_loaded) {
+			printf("64DD cart expansion: clearing loaded disk %.4s for cart ID %.4s.\n", dd_disk_was_id, cart_id);
+		}
+		n64dd_clear_disk_save_state();
+	}
 
 	mount_all_saves();
 
