@@ -43,6 +43,7 @@ static constexpr auto SYS_TYPE_OPT = "[80:79]";
 static constexpr auto AUTOPAK_OPT = "[81]";
 static constexpr auto PATCHES_OPT = "[90]";
 static constexpr auto CHEATS_OPT = "[103]";
+static constexpr auto DD_DEVELOPMENT_OPT = "[107]";
 static constexpr const char* const CONTROLLER_OPTS[] = { "[51:49]", "[54:52]", "[57:55]", "[60:58]" };
 
 // Simple hash function, see: https://en.wikipedia.org/wiki/Fowler%E2%80%93Noll%E2%80%93Vo_hash_function
@@ -1510,6 +1511,7 @@ static constexpr uint32_t N64DD_NDD_SIZE = 0x03DEC800;
 static constexpr uint32_t N64DD_PHYSICAL_SIZE = 0x0435B0C0;
 static constexpr uint32_t N64DD_EXPANDED_SIZE = 0x06E28000;
 static constexpr uint32_t N64DD_SYSTEM_SECTOR_LENGTH = 232;
+static constexpr uint32_t N64DD_DEV_SYSTEM_SECTOR_LENGTH = 192;
 static constexpr uint32_t N64DD_SECTORS_PER_BLOCK = 85;
 static constexpr uint32_t N64DD_BAD_TRACKS_PER_ZONE = 12;
 static constexpr uint32_t N64DD_FLAT_HEAD_STRIDE = 0x03714000;
@@ -1725,6 +1727,12 @@ static bool n64dd_copy_ipl_to_mem(fileTYPE* file, const char* name, uint8_t* ddi
 		}
 
 		normalize_data(buf, chunk, rom_endianness);
+
+		if (is_first_chunk) {
+			const bool development_ipl = !memcmp(buf + 0x3B, "NDXJ", 4);
+			user_io_status_set(DD_DEVELOPMENT_OPT, development_ipl ? 1 : 0);
+			printf("64DD IPL: %s drive ID selected.\n", development_ipl ? "development" : "retail");
+		}
 
 		if (is_first_chunk && boot_dest) {
 			uint64_t bootcode_sums[2] = { };
@@ -2171,7 +2179,7 @@ static void n64dd_debug_boot_lba(uint32_t lba, uint64_t source_offset, uint32_t 
 	printf("\n");
 }
 
-static bool n64dd_pack_expanded_ndd(fileTYPE* file, uint8_t* dest) {
+static bool n64dd_pack_expanded_ndd(fileTYPE* file, uint8_t* dest, bool development) {
 	std::vector<uint8_t> block_data;
 
 	for (uint32_t pzone = 0; pzone < 16; pzone++) {
@@ -2179,10 +2187,12 @@ static bool n64dd_pack_expanded_ndd(fileTYPE* file, uint8_t* dest) {
 
 		for (uint32_t zone_track = 0; zone_track < zone.tracks; zone_track++) {
 			const uint32_t track = zone.track_offset + zone_track;
+			const bool development_system_track = development && zone.head == 0 && (track == 1 || track == 5);
+			const uint32_t sector_length = development_system_track ? N64DD_DEV_SYSTEM_SECTOR_LENGTH : zone.sector_length;
 
 			for (uint32_t block = 0; block < 2; block++) {
 				const uint32_t source_offset = n64dd_expanded_offset(track, zone.head, block);
-				if (!n64dd_copy_block_to_flat(file, source_offset, dest, track, zone.head, block, zone.sector_length, block_data)) {
+				if (!n64dd_copy_block_to_flat(file, source_offset, dest, track, zone.head, block, sector_length, block_data)) {
 					return false;
 				}
 			}
@@ -2241,7 +2251,8 @@ static bool n64dd_read_disk_id(fileTYPE* file, char* disk_id) {
 	return valid_id;
 }
 
-static bool n64dd_find_ndd_system_block(fileTYPE* file, std::vector<uint8_t>& sys_data, uint8_t& disk_type, std::vector<uint8_t>& bad_lbas, char* disk_id, bool verbose = true) {
+static bool n64dd_find_ndd_system_block(fileTYPE* file, std::vector<uint8_t>& sys_data, uint8_t& disk_type,
+	std::vector<uint8_t>& bad_lbas, char* disk_id, bool verbose = true, bool* development = nullptr) {
 	static constexpr uint8_t retail_system_blocks[4] = {9, 8, 1, 0};
 	static constexpr uint8_t dev_system_blocks[4] = {11, 10, 3, 2};
 	static constexpr uint8_t retail_bad_blocks[13] = {2, 3, 10, 11, 12, 16, 17, 18, 19, 20, 21, 22, 23};
@@ -2252,6 +2263,7 @@ static bool n64dd_find_ndd_system_block(fileTYPE* file, std::vector<uint8_t>& sy
 	uint8_t best_system_block = 0;
 	bool found = false;
 	if (disk_id) disk_id[0] = '\0';
+	if (development) *development = false;
 
 	bad_lbas.assign(0x10DC, 0);
 	for (uint8_t system_block : retail_system_blocks) {
@@ -2303,6 +2315,7 @@ static bool n64dd_find_ndd_system_block(fileTYPE* file, std::vector<uint8_t>& sy
 
 		sys_data.swap(best_sys_data);
 		disk_type = best_disk_type;
+		if (development) *development = true;
 		if (verbose) {
 			printf("64DD NDD: development system block %u, disk type %u.\n", (unsigned)best_system_block, (unsigned)disk_type);
 			if (disk_id && disk_id[0]) printf("64DD NDD: disk ID %.4s.\n", disk_id);
@@ -2364,12 +2377,15 @@ static bool n64dd_pack_compact_ndd_to_physical(fileTYPE* file, std::vector<uint8
 	return source_offset == (uint64_t)file->size;
 }
 
-static bool n64dd_expand_ndd_to_flat(fileTYPE* file, uint8_t* dest, bool& cart_expansion_disk, char* disk_id, uint8_t& disk_type, bool verbose = true) {
+static bool n64dd_expand_ndd_to_flat(fileTYPE* file, uint8_t* dest, bool& cart_expansion_disk, char* disk_id,
+	uint8_t& disk_type, bool verbose = true, bool* development_out = nullptr) {
 	if (file->size != N64DD_NDD_SIZE) return false;
 
 	std::vector<uint8_t> sys_data;
 	std::vector<uint8_t> bad_lbas;
-	if (!n64dd_find_ndd_system_block(file, sys_data, disk_type, bad_lbas, disk_id, verbose)) return false;
+	bool development = false;
+	if (!n64dd_find_ndd_system_block(file, sys_data, disk_type, bad_lbas, disk_id, verbose, &development)) return false;
+	if (development_out) *development_out = development;
 	cart_expansion_disk = disk_id && disk_id[0] == 'E';
 	if (verbose && cart_expansion_disk) {
 		printf("64DD NDD: cart expansion disk detected, IPL boot disabled.\n");
@@ -2415,10 +2431,12 @@ static bool n64dd_expand_ndd_to_flat(fileTYPE* file, uint8_t* dest, bool& cart_e
 			for (uint32_t block = 0; block < 2; block++) {
 				const uint32_t physical_block = starting_block ^ block;
 				if (lba >= bad_lbas.size()) return false;
-				if (!n64dd_copy_block_to_flat(file, source_offset, dest, track, zone.head, physical_block, zone.sector_length, block_data)) {
+				const bool development_system_lba = development && (lba == 2 || lba == 3 || lba == 10 || lba == 11);
+				const uint32_t sector_length = development_system_lba ? N64DD_DEV_SYSTEM_SECTOR_LENGTH : zone.sector_length;
+				if (!n64dd_copy_block_to_flat(file, source_offset, dest, track, zone.head, physical_block, sector_length, block_data)) {
 					return false;
 				}
-				if (verbose) n64dd_debug_boot_lba(lba, source_offset, track, zone.head, physical_block, zone.sector_length, bad_lbas[lba] != 0, block_data);
+				if (verbose) n64dd_debug_boot_lba(lba, source_offset, track, zone.head, physical_block, sector_length, bad_lbas[lba] != 0, block_data);
 				if (bad_lbas[lba]) {
 					if (!n64dd_mark_bad_flat_block(dest, track, zone.head, physical_block)) return false;
 					marked_bad_blocks++;
@@ -2712,7 +2730,13 @@ static bool n64dd_build_original_flat_image(const char* disk_path, uint8_t disk_
 
 	bool ok = false;
 	if (base_file.size == N64DD_PHYSICAL_SIZE) {
-		ok = n64dd_pack_expanded_ndd(&base_file, original_flat.data());
+		std::vector<uint8_t> sys_data;
+		std::vector<uint8_t> bad_lbas;
+		uint8_t detected_disk_type = disk_type;
+		bool development = false;
+		if (n64dd_find_ndd_system_block(&base_file, sys_data, detected_disk_type, bad_lbas, nullptr, false, &development)) {
+			ok = n64dd_pack_expanded_ndd(&base_file, original_flat.data(), development);
+		}
 	} else if (base_file.size == N64DD_NDD_SIZE) {
 		bool cart_expansion_disk = false;
 		char disk_id[5] = {};
@@ -3288,23 +3312,24 @@ static int n64_dd_disk_tx(fileTYPE* file, const char* name, const unsigned char 
 	memset(mem, 0, N64DD_EXPANDED_SIZE);
 	bool ok = false;
 	bool cart_expansion_disk = false;
+	bool development_disk = false;
 	uint8_t disk_type = 0;
 	char disk_id[5] = {};
 	if (file->size == N64DD_PHYSICAL_SIZE) {
 		printf("64DD disk loader: physical/MAME image, expanding to flat DDR layout (%u bytes).\n", N64DD_EXPANDED_SIZE);
 		std::vector<uint8_t> sys_data;
 		std::vector<uint8_t> bad_lbas;
-		if (n64dd_find_ndd_system_block(file, sys_data, disk_type, bad_lbas, disk_id)) {
+		if (n64dd_find_ndd_system_block(file, sys_data, disk_type, bad_lbas, disk_id, true, &development_disk)) {
 			printf("64DD disk: disk ID %.4s.\n", disk_id);
 			cart_expansion_disk = disk_id[0] == 'E';
 		} else if (n64dd_read_disk_id(file, disk_id)) {
 			printf("64DD disk: disk ID %.4s, disk type unknown.\n", disk_id);
 			cart_expansion_disk = disk_id[0] == 'E';
 		}
-		ok = n64dd_pack_expanded_ndd(file, mem);
+		ok = n64dd_pack_expanded_ndd(file, mem, development_disk);
 	} else if (file->size == N64DD_NDD_SIZE) {
 		printf("64DD disk loader: compact NDD image, expanding to flat DDR layout (%u bytes).\n", N64DD_EXPANDED_SIZE);
-		ok = n64dd_expand_ndd_to_flat(file, mem, cart_expansion_disk, disk_id, disk_type);
+		ok = n64dd_expand_ndd_to_flat(file, mem, cart_expansion_disk, disk_id, disk_type, true, &development_disk);
 		if (ok) {
 			ok = n64dd_stamp_compact_ndd_disk_id_flat(name, mem, disk_type);
 			if (ok && N64DD_VERBOSE_LOG) printf("64DD NDD: applied deterministic MiSTer disk ID stamp.\n");
