@@ -9,6 +9,7 @@
 
 #include "../../hardware.h"
 #include "../../menu.h"
+#include "../../osd.h"
 #include "../../shmem.h"
 #include "../../lib/md5/md5.h"
 
@@ -1506,6 +1507,7 @@ void n64_poll() {
 static constexpr uint32_t N64_ROM_FASTLOAD_ADDR = 0x32000000;
 static constexpr uint32_t N64DD_IPL_LOAD_ADDR = 0x33BC0000;
 static constexpr const char* N64DD_IPL_BOOT_FILE = "boot3.rom";
+static constexpr const char* N64DD_IPL_DISK_FILE = "dd_bios.rom";
 static constexpr uint32_t N64DD_IPL_SIZE = 4 * 1024 * 1024;
 static constexpr uint32_t N64DD_NDD_SIZE = 0x03DEC800;
 static constexpr uint32_t N64DD_PHYSICAL_SIZE = 0x0435B0C0;
@@ -2478,6 +2480,14 @@ static bool n64dd_build_ram_sector_map(const char* disk_path, uint8_t disk_type,
 	return true;
 }
 
+static void n64dd_begin_save_ui() {
+	menu_process_save();
+	if (user_io_osd_is_visible()) {
+		HandleUI();
+		OsdUpdate();
+	}
+}
+
 static bool n64dd_build_ram_image(const char* disk_path, const uint8_t* flat, uint8_t disk_type,
 	std::vector<uint8_t>& ram) {
 	ram.clear();
@@ -2515,7 +2525,7 @@ static bool n64dd_save_ram_image(const char* save_path, const char* disk_path, u
 	}
 
 	diskled_on();
-	menu_process_save();
+	n64dd_begin_save_ui();
 	if (!n64dd_write_vector_to_file(save_path, ram)) return false;
 
 	n64dd_clear_dirty_flat_blocks(mem, dirty_blocks);
@@ -2836,7 +2846,7 @@ static bool n64dd_save_disk_image(const char* save_path, const char* disk_path, 
 	}
 
 	diskled_on();
-	menu_process_save();
+	n64dd_begin_save_ui();
 	if (!n64dd_write_vector_to_file(save_path, physical)) {
 		return false;
 	}
@@ -2966,20 +2976,20 @@ static int n64_dd_ipl_tx(fileTYPE* file, const char* name, const unsigned char i
 	return 1;
 }
 
-static bool n64dd_open_boot_ipl(fileTYPE* file, const char* disk_path, char* boot_path, size_t boot_path_size) {
+static bool n64dd_open_disk_ipl(fileTYPE* file, const char* disk_path, char* boot_path, size_t boot_path_size) {
 	const char* slash = strrchr(disk_path, '/');
 	const char* backslash = strrchr(disk_path, '\\');
 	if (backslash && (!slash || backslash > slash)) slash = backslash;
 
 	if (slash) {
 		const size_t dir_len = slash - disk_path;
-		if (dir_len + strlen("/") + strlen(N64DD_IPL_BOOT_FILE) < boot_path_size) {
-			snprintf(boot_path, boot_path_size, "%.*s/%s", (int)dir_len, disk_path, N64DD_IPL_BOOT_FILE);
-			if (FileOpen(file, boot_path, 1)) return true;
-		}
+		if (dir_len + 1 + strlen(N64DD_IPL_DISK_FILE) >= boot_path_size) return false;
+		snprintf(boot_path, boot_path_size, "%.*s/%s", (int)dir_len, disk_path, N64DD_IPL_DISK_FILE);
+	} else {
+		if (strlen(N64DD_IPL_DISK_FILE) >= boot_path_size) return false;
+		snprintf(boot_path, boot_path_size, "%s", N64DD_IPL_DISK_FILE);
 	}
 
-	snprintf(boot_path, boot_path_size, "%s/%s", HomeDir(), N64DD_IPL_BOOT_FILE);
 	return FileOpen(file, boot_path, 1);
 }
 
@@ -2987,8 +2997,8 @@ static int n64dd_autoload_ipl(const char* disk_path, bool boot_ipl) {
 	fileTYPE ipl_file = {};
 	char boot_path[1024];
 
-	if (!n64dd_open_boot_ipl(&ipl_file, disk_path, boot_path, sizeof(boot_path))) {
-		printf("64DD IPL autoload: %s not found.\n", N64DD_IPL_BOOT_FILE);
+	if (!n64dd_open_disk_ipl(&ipl_file, disk_path, boot_path, sizeof(boot_path))) {
+		printf("64DD IPL override: %s not found beside disk; keeping startup IPL.\n", N64DD_IPL_DISK_FILE);
 		return 1;
 	}
 
@@ -3461,6 +3471,16 @@ int n64_rom_tx(const char* name, const unsigned char idx, const uint32_t load_ad
 	}
 
 	return 1;
+}
+
+int n64_load_dd_ipl() {
+	char boot_path[1024];
+	snprintf(boot_path, sizeof(boot_path), "%s/%s", HomeDir(), N64DD_IPL_BOOT_FILE);
+	if (!FileExists(boot_path, 0)) return 0;
+
+	printf("64DD IPL startup: booting root IPL \"%s\".\n", boot_path);
+	uint32_t file_crc = 0;
+	return n64_rom_tx(boot_path, 4, N64DD_IPL_LOAD_ADDR, file_crc);
 }
 
 #pragma pop_macro("NONE")

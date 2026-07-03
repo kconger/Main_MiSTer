@@ -14,6 +14,7 @@ struct N64SaveFile;
 
 void n64_reset();
 void n64_poll();
+int n64_load_dd_ipl();
 void n64_save_dd_disk();
 void n64_cheats_send(const void* buf_ptr, const uint32_t size);
 int n64_rom_tx(const char* name, const unsigned char index, const uint32_t load_addr, uint32_t& file_crc);
