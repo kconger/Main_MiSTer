@@ -3,7 +3,6 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
-#include <unistd.h>
 #include <sys/stat.h>
 #include <algorithm>
 #include <vector>
@@ -16,6 +15,7 @@
 
 #include "miniz.h"
 #include "n64.h"
+#include "n64_cpak_header.h"
 
 #pragma push_macro("NONE")
 #pragma push_macro("BIG_ENDIAN")
@@ -46,19 +46,6 @@ static constexpr auto PATCHES_OPT = "[90]";
 static constexpr auto CHEATS_OPT = "[103]";
 static constexpr auto DD_DEVELOPMENT_OPT = "[107]";
 static constexpr const char* const CONTROLLER_OPTS[] = { "[51:49]", "[54:52]", "[57:55]", "[60:58]" };
-
-static constexpr size_t CPAK_PAGE_SIZE = 256; // N64 controller pak page size
-static constexpr size_t CPAK_ID_SECTOR_PAGE = 0;
-static constexpr size_t CPAK_FAT_PAGE = 1;
-static constexpr size_t CPAK_FAT_BACKUP_PAGE = 2;
-
-// Page 0 is divided into 8 slots of 32 bytes each.
-// The N64 hardware requires the ID info to be repeated in specific slots.
-static constexpr size_t CPAK_ID_ENTRY_SIZE = 32;
-static constexpr size_t CPAK_ID_ENTRY_1_OFFSET = CPAK_ID_ENTRY_SIZE * 1;
-static constexpr size_t CPAK_ID_ENTRY_2_OFFSET = CPAK_ID_ENTRY_SIZE * 3;
-static constexpr size_t CPAK_ID_ENTRY_3_OFFSET = CPAK_ID_ENTRY_SIZE * 4;
-static constexpr size_t CPAK_ID_ENTRY_4_OFFSET = CPAK_ID_ENTRY_SIZE * 6;
 
 // Simple hash function, see: https://en.wikipedia.org/wiki/Fowler%E2%80%93Noll%E2%80%93Vo_hash_function
 // (Modified to make it case-insensitive)
@@ -339,84 +326,6 @@ static uint32_t get_save_offset(unsigned char idx) {
 	return offset;
 }
 
-// *** Controller PAK stuff, heavily influenced by Libdragon's "cpaktool" ***
-
-// Minimalistic CPAK formatter/initializer.
-static void cpak_calc_id_crc(uint8_t* id_block) {
-	uint16_t sum = 0;
-	// Sum first 14 half-words.
-	// The overflowing is done on purpose.
-	for (size_t i = 0; i < 14; i++) {
-		sum += (id_block[i << 1] << 8) | id_block[(i << 1) | 1];
-	}
-
-	id_block[0x1c] = sum >> 8;
-	id_block[0x1d] = sum & 0xff;
-
-	// Inverted checksum.
-	// The N64 expects (0xfff2 - sum), NOT (~sum). Weird.
-	const uint16_t inv_sum = 0xfff2 - sum;
-	id_block[0x1e] = inv_sum >> 8;
-	id_block[0x1f] = inv_sum & 0xff;
-}
-
-static uint8_t cpak_calc_fat_crc(const uint8_t* page_data) {
-	uint8_t sum = 0;
-	// The overflowing is done on purpose.
-	for (size_t i = 2; i < CPAK_PAGE_SIZE; i++) {
-		sum += page_data[i];
-	}
-	return sum;
-}
-
-static void cpak_format(uint8_t* data) {
-	// Initialize the seed() function.
-	uint32_t seed;
-	int32_t rndfd = open("/dev/urandom", O_RDONLY);
-	read(rndfd, &seed, sizeof(seed));
-	close(rndfd);
-	srand(seed);
-	
-	memset(data, 0, get_save_size(MemoryType::CPAK));
-	uint8_t id_template[CPAK_ID_ENTRY_SIZE];
-	memset(id_template, 0, CPAK_ID_ENTRY_SIZE);
-
-	// (0x00-0x17) contains a serial number,
-	// unique for that controller pak.
-	// We fill (0x00-0x10) with random data.
-	for (size_t i = 0; i < 0x10; i++) {
-		id_template[i] = (uint8_t)(rand() & 0xff);
-	}
-
-	// The rest of the serial is some deterministic branding. :)
-	memcpy(&id_template[0x10], "MiSTer", 6);
-
-	id_template[0x19] = 0x81; // Device ID. (controller pak)
-	id_template[0x1a] = 0x01; // 1 bank
-
-	cpak_calc_id_crc(id_template);
-
-	// Write ID block to the 4 specified locations in page 0.
-	const size_t p0_base = CPAK_ID_SECTOR_PAGE * CPAK_PAGE_SIZE;
-	memcpy(data + p0_base + CPAK_ID_ENTRY_1_OFFSET, id_template, CPAK_ID_ENTRY_SIZE);
-	memcpy(data + p0_base + CPAK_ID_ENTRY_2_OFFSET, id_template, CPAK_ID_ENTRY_SIZE);
-	memcpy(data + p0_base + CPAK_ID_ENTRY_3_OFFSET, id_template, CPAK_ID_ENTRY_SIZE);
-	memcpy(data + p0_base + CPAK_ID_ENTRY_4_OFFSET, id_template, CPAK_ID_ENTRY_SIZE);
-
-	uint8_t fat_page[CPAK_PAGE_SIZE];
-	memset(fat_page, 0, CPAK_PAGE_SIZE);
-
-	// Init the user entries (index 5 to 127) to (0x00, 0x03), repeating.
-	for (size_t i = 5; i < (CPAK_PAGE_SIZE >> 1); i++) {
-		fat_page[(i << 1) | 1] = 0x03;
-	}
-
-	fat_page[1] = cpak_calc_fat_crc(fat_page);
-
-	memcpy(data + (CPAK_FAT_PAGE * CPAK_PAGE_SIZE), fat_page, CPAK_PAGE_SIZE);
-	memcpy(data + (CPAK_FAT_BACKUP_PAGE * CPAK_PAGE_SIZE), fat_page, CPAK_PAGE_SIZE);
-}
-
 static char full_path[1024];
 static uint8_t save_file_buf[0x20000]; // Largest save size
 static uint8_t mounted_save_files = 0;
@@ -455,7 +364,7 @@ static size_t read_file(const char* filename, uint8_t* data, uint32_t offset, si
 
 static bool is_empty(uint8_t* arr, size_t sz) {
 	for (; sz-- > 0; arr++) {
-		if ((*arr != 0x00) && (*arr != 0xff)) return false;
+		if (*arr) return false;
 	}
 
 	return true;
@@ -518,31 +427,24 @@ struct N64SaveFile {
 			return false;
 		}
 
-		size_t sz = this->get_size();
+		auto sz = this->get_size();
+		memset(save_file_buf, 0xFF, sz);
 		bool found_old_data = false;
 
 		if (sz && FileExists(old_path, 0)) {
 			uint32_t off = get_save_offset((this->idx < 0) ? mounted_save_files : this->idx);
-			size_t read_bytes;
-			if ((read_bytes = read_file(old_path, save_file_buf, off, sz)) && !is_empty(save_file_buf, sz)) {
+			if (read_file(old_path, save_file_buf, off, sz)) {
 				printf("Found old save data \"%s\", converting to %s.\n", old_path, stringify(type));
 				found_old_data = true;
+				// Normalize data to big-endian format, if needed
 				if (this->needs_byteswap()) {
-					normalize_data(save_file_buf, read_bytes, ByteOrder::LITTLE_ENDIAN);
-				}
-				if (read_bytes < sz) {
-					memset(save_file_buf + read_bytes, 0xff, (sz - read_bytes));
+					normalize_data(save_file_buf, sz, ByteOrder::LITTLE_ENDIAN);
 				}
 			}
 		}
 
-		if (!found_old_data) {
-			if (this->type == MemoryType::CPAK) {
-				cpak_format(save_file_buf);
-			}
-			else {
-				memset(save_file_buf, 0xff, sz);
-			}
+		if (!found_old_data && (this->type == MemoryType::CPAK)) {
+			memcpy(save_file_buf, cpak_header[((this->idx < 0) ? mounted_save_files : idx) % (sizeof(cpak_header) / sizeof(*cpak_header))], sizeof(*cpak_header));
 		}
 
 		return create_file(path, save_file_buf, sz);
@@ -1548,7 +1450,7 @@ void n64_poll() {
 	if (!poll_timer || CheckTimer(poll_timer)) {
 		if (!(loaded && is_fpga_ready(0))) {
 			poll_timer = GetTimer(1000);
-			printf("Waiting for N64 game to be loaded...\n");
+			//printf("Waiting for N64 game to be loaded...\n");
 			return;
 		}
 
@@ -2354,7 +2256,7 @@ static bool n64dd_expand_ndd_to_flat(fileTYPE* file, uint8_t* dest, bool& cart_e
 	if (development_out) *development_out = development;
 	cart_expansion_disk = disk_id && disk_id[0] == 'E';
 	if (verbose && cart_expansion_disk) {
-		printf("64DD NDD: cart expansion disk detected, IPL boot disabled.\n");
+		printf("64DD NDD: cart expansion disk detected.\n");
 	}
 
 	uint64_t source_offset = 0;
@@ -3074,21 +2976,47 @@ static int n64_dd_ipl_tx(fileTYPE* file, const char* name, const unsigned char i
 	return 1;
 }
 
-static bool n64dd_open_disk_ipl(fileTYPE* file, const char* disk_path, char* boot_path, size_t boot_path_size) {
+static bool n64dd_make_companion_path(const char* disk_path, const char* companion_name,
+	char* companion_path, size_t companion_path_size) {
 	const char* slash = strrchr(disk_path, '/');
 	const char* backslash = strrchr(disk_path, '\\');
 	if (backslash && (!slash || backslash > slash)) slash = backslash;
 
 	if (slash) {
 		const size_t dir_len = slash - disk_path;
-		if (dir_len + 1 + strlen(N64DD_IPL_DISK_FILE) >= boot_path_size) return false;
-		snprintf(boot_path, boot_path_size, "%.*s/%s", (int)dir_len, disk_path, N64DD_IPL_DISK_FILE);
+		if (dir_len + 1 + strlen(companion_name) >= companion_path_size) return false;
+		snprintf(companion_path, companion_path_size, "%.*s/%s", (int)dir_len, disk_path, companion_name);
 	} else {
-		if (strlen(N64DD_IPL_DISK_FILE) >= boot_path_size) return false;
-		snprintf(boot_path, boot_path_size, "%s", N64DD_IPL_DISK_FILE);
+		if (strlen(companion_name) >= companion_path_size) return false;
+		snprintf(companion_path, companion_path_size, "%s", companion_name);
 	}
 
+	return true;
+}
+
+static bool n64dd_open_disk_ipl(fileTYPE* file, const char* disk_path, char* boot_path, size_t boot_path_size) {
+	if (!n64dd_make_companion_path(disk_path, N64DD_IPL_DISK_FILE, boot_path, boot_path_size)) return false;
 	return FileOpen(file, boot_path, 1);
+}
+
+static bool n64dd_make_cart_path(const char* disk_path, char* cart_path, size_t cart_path_size) {
+	const size_t disk_path_len = strlen(disk_path);
+	if (disk_path_len + 1 > cart_path_size) return false;
+
+	strcpy(cart_path, disk_path);
+	char* slash = strrchr(cart_path, '/');
+	char* backslash = strrchr(cart_path, '\\');
+	if (backslash && (!slash || backslash > slash)) slash = backslash;
+	char* extension = strrchr(cart_path, '.');
+	if (extension && (!slash || extension > slash)) {
+		if ((size_t)(extension - cart_path) + strlen(".rom") + 1 > cart_path_size) return false;
+		strcpy(extension, ".rom");
+	} else {
+		if (disk_path_len + strlen(".rom") + 1 > cart_path_size) return false;
+		strcat(cart_path, ".rom");
+	}
+
+	return true;
 }
 
 static int n64dd_autoload_ipl(const char* disk_path, bool boot_ipl) {
@@ -3101,7 +3029,7 @@ static int n64dd_autoload_ipl(const char* disk_path, bool boot_ipl) {
 	}
 
 	printf("64DD IPL autoload: %s \"%s\".\n",
-		boot_ipl ? "booting" : "preloading IPL ROM for cart expansion from",
+		boot_ipl ? "booting" : "preloading before companion cart",
 		boot_path);
 	if (boot_ipl) unmount_all_saves();
 	return n64_dd_ipl_tx(&ipl_file, boot_path, boot_ipl ? 4 : 5, N64DD_IPL_LOAD_ADDR);
@@ -3184,7 +3112,7 @@ static int n64_dd_disk_tx(fileTYPE* file, const char* name, const unsigned char 
 
 	if (ok) {
 		if (cart_expansion_disk) {
-			printf("64DD disk: cart expansion disk detected, IPL boot disabled.\n");
+			printf("64DD disk: cart expansion disk detected.\n");
 		}
 		strncpy(current_dd_save_path, disk_save_path, sizeof(current_dd_save_path) - 1);
 		current_dd_save_path[sizeof(current_dd_save_path) - 1] = '\0';
@@ -3216,7 +3144,17 @@ static int n64_dd_disk_tx(fileTYPE* file, const char* name, const unsigned char 
 	strncpy(current_dd_disk_id, disk_id, sizeof(current_dd_disk_id) - 1);
 	current_dd_disk_id[sizeof(current_dd_disk_id) - 1] = '\0';
 	printf("Done loading 64DD disk image.\n");
-	return n64dd_autoload_ipl(name, !current_dd_cart_expansion);
+
+	char cart_path[1024] = {};
+	const bool autoload_cart =
+		n64dd_make_cart_path(name, cart_path, sizeof(cart_path)) &&
+		FileExists(cart_path, 0);
+	if (!n64dd_autoload_ipl(name, !autoload_cart)) return 0;
+	if (!autoload_cart) return 1;
+
+	printf("64DD cart autoload: loading \"%s\" after disk and IPL.\n", cart_path);
+	uint32_t cart_crc = 0;
+	return n64_rom_tx(cart_path, 1, N64_ROM_FASTLOAD_ADDR, cart_crc);
 }
 
 int n64_rom_tx(const char* name, const unsigned char idx, const uint32_t load_addr, uint32_t& file_crc) {
