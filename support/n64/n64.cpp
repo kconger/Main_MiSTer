@@ -1516,6 +1516,7 @@ void n64_poll() {
 static constexpr uint32_t N64_ROM_FASTLOAD_ADDR = 0x32000000;
 static constexpr uint32_t N64DD_IPL_LOAD_ADDR = 0x33BC0000;
 static constexpr const char* N64DD_IPL_BOOT_FILE = "boot3.rom";
+static constexpr const char* N64DD_IPL_DEV_BOOT_FILE = "boot4.rom";
 static constexpr const char* N64DD_IPL_DISK_FILE = "dd_bios.rom";
 static constexpr uint32_t N64DD_IPL_SIZE = 4 * 1024 * 1024;
 static constexpr uint32_t N64DD_NDD_SIZE = 0x03DEC800;
@@ -3028,13 +3029,21 @@ static bool n64dd_make_cart_path(const char* disk_path, char* cart_path, size_t 
 	return true;
 }
 
-static int n64dd_autoload_ipl(const char* disk_path, bool boot_ipl) {
+static int n64dd_autoload_ipl(const char* disk_path, bool boot_ipl, bool development_disk) {
 	fileTYPE ipl_file = {};
 	char boot_path[1024];
 
 	if (!n64dd_open_disk_ipl(&ipl_file, disk_path, boot_path, sizeof(boot_path))) {
-		printf("64DD IPL override: %s not found beside disk; keeping startup IPL.\n", N64DD_IPL_DISK_FILE);
-		return 1;
+		const char* root_ipl = development_disk ? N64DD_IPL_DEV_BOOT_FILE : N64DD_IPL_BOOT_FILE;
+		snprintf(boot_path, sizeof(boot_path), "%s/%s", HomeDir(), root_ipl);
+		if (!strcmp(current_rom_path, boot_path)) {
+			printf("64DD IPL autoload: root %s is already loaded; keeping current IPL.\n", root_ipl);
+			return 1;
+		}
+		if (!FileOpen(&ipl_file, boot_path, 1)) {
+			printf("64DD IPL autoload: root %s not found; keeping startup IPL.\n", root_ipl);
+			return 1;
+		}
 	}
 
 	printf("64DD IPL autoload: %s \"%s\".\n",
@@ -3158,7 +3167,7 @@ static int n64_dd_disk_tx(fileTYPE* file, const char* name, const unsigned char 
 	const bool autoload_cart =
 		n64dd_make_cart_path(name, cart_path, sizeof(cart_path)) &&
 		FileExists(cart_path, 0);
-	if (!n64dd_autoload_ipl(name, !autoload_cart)) return 0;
+	if (!n64dd_autoload_ipl(name, !autoload_cart, development_disk)) return 0;
 	if (!autoload_cart) return 1;
 
 	printf("64DD cart autoload: loading \"%s\" after disk and IPL.\n", cart_path);
