@@ -1905,47 +1905,6 @@ static bool n64dd_file_matches_vector(const char* path, const std::vector<uint8_
 	return true;
 }
 
-static uint8_t n64dd_bcd(uint32_t value) {
-	value %= 100;
-	return (uint8_t)(((value / 10) << 4) | (value % 10));
-}
-
-static uint32_t n64dd_hash_string(const char* text) {
-	uint32_t hash = 2166136261U;
-	while (text && *text) {
-		hash ^= (uint8_t)*text++;
-		hash *= 16777619U;
-	}
-	return hash;
-}
-
-static void n64dd_make_disk_id_stamp(const char* disk_path, uint8_t stamp[8]) {
-	const uint32_t hash = n64dd_hash_string(disk_path);
-	stamp[0] = (uint8_t)(hash >> 24);
-	stamp[1] = n64dd_bcd(20);
-	stamp[2] = n64dd_bcd(26);
-	stamp[3] = n64dd_bcd(1 + (hash % 12));
-	stamp[4] = n64dd_bcd(1 + ((hash >> 4) % 28));
-	stamp[5] = n64dd_bcd((hash >> 9) % 24);
-	stamp[6] = n64dd_bcd((hash >> 14) % 60);
-	stamp[7] = n64dd_bcd((hash >> 20) % 60);
-}
-
-static void n64dd_stamp_disk_id_sector(uint8_t* sector, const uint8_t stamp[8]) {
-	sector[0x0B] = stamp[0];
-	sector[0x0C] = 'M';
-	sector[0x0D] = 'I';
-	sector[0x0E] = 'S';
-	sector[0x0F] = 'T';
-	sector[0x11] = stamp[1];
-	sector[0x12] = stamp[2];
-	sector[0x13] = stamp[3];
-	sector[0x14] = stamp[4];
-	sector[0x15] = stamp[5];
-	sector[0x16] = stamp[6];
-	sector[0x17] = stamp[7];
-}
-
 static bool n64dd_pack_expanded_ndd(fileTYPE* file, uint8_t* dest, bool development) {
 	std::vector<uint8_t> block_data;
 
@@ -2379,25 +2338,6 @@ static bool n64dd_load_ram_save_to_mem(const char* save_path, const char* disk_p
 	return true;
 }
 
-static bool n64dd_stamp_compact_ndd_disk_id_flat(const char* disk_path, uint8_t* flat, uint8_t disk_type) {
-	if (!flat || disk_type >= 7) return false;
-
-	uint8_t stamp[8] = {};
-	n64dd_make_disk_id_stamp(disk_path, stamp);
-
-	static constexpr uint32_t DISK_ID_TRACK = 7;
-	static constexpr uint32_t DISK_ID_BLOCKS[2] = {1, 0};
-	for (uint32_t block_index = 0; block_index < 2; block_index++) {
-		for (uint32_t sector = 0; sector < N64DD_SECTORS_PER_BLOCK; sector++) {
-			const uint32_t offset = n64dd_flat_offset(DISK_ID_TRACK, 0, DISK_ID_BLOCKS[block_index], sector);
-			if ((offset + N64DD_SYSTEM_SECTOR_LENGTH) > N64DD_EXPANDED_SIZE) return false;
-			n64dd_stamp_disk_id_sector(flat + offset, stamp);
-		}
-	}
-
-	return true;
-}
-
 static int n64_dd_ipl_tx(fileTYPE* file, const char* name, const unsigned char idx, const uint32_t load_addr) {
 	uint32_t data_size = file->size;
 	const bool boot_ipl = ((idx & 0x3f) == 4);
@@ -2581,9 +2521,6 @@ static int n64_dd_disk_tx(fileTYPE* file, const char* name, const unsigned char 
 	} else if (file->size == N64DD_NDD_SIZE) {
 		printf("64DD disk loader: compact NDD image, expanding to flat DDR layout (%u bytes).\n", N64DD_EXPANDED_SIZE);
 		ok = n64dd_expand_ndd_to_flat(file, mem, cart_expansion_disk, disk_id, disk_type, &development_disk);
-		if (ok) {
-			ok = n64dd_stamp_compact_ndd_disk_id_flat(name, mem, disk_type);
-		}
 	} else {
 		printf("Unsupported 64DD disk image size: %llu bytes.\n", (unsigned long long)file->size);
 	}
