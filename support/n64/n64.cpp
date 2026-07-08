@@ -1513,7 +1513,7 @@ void n64_poll() {
 }
 
 static constexpr uint32_t N64_ROM_FASTLOAD_ADDR = 0x32000000;
-static constexpr uint32_t N64DD_IPL_LOAD_ADDR = 0x33BC0000;
+static constexpr uint32_t N64DD_IPL_LOAD_ADDR = 0x30C00000;
 static constexpr const char* N64DD_IPL_BOOT_FILE = "boot3.rom";
 static constexpr const char* N64DD_IPL_DEV_BOOT_FILE = "boot4.rom";
 static constexpr const char* N64DD_IPL_US_BOOT_FILE = "boot5.rom";
