@@ -344,7 +344,8 @@ static uint32_t get_save_offset(unsigned char idx) {
 // Minimalistic CPAK formatter/initializer.
 static void cpak_calc_id_crc(uint8_t* id_block) {
 	uint16_t sum = 0;
-	// Sum first 14 half-words. The overflow is intentional.
+	// Sum first 14 half-words.
+	// The overflowing is done on purpose.
 	for (size_t i = 0; i < 14; i++) {
 		sum += (id_block[i << 1] << 8) | id_block[(i << 1) | 1];
 	}
@@ -352,7 +353,8 @@ static void cpak_calc_id_crc(uint8_t* id_block) {
 	id_block[0x1c] = sum >> 8;
 	id_block[0x1d] = sum & 0xff;
 
-	// The N64 expects (0xfff2 - sum), not (~sum).
+	// Inverted checksum.
+	// The N64 expects (0xfff2 - sum), NOT (~sum). Weird.
 	const uint16_t inv_sum = 0xfff2 - sum;
 	id_block[0x1e] = inv_sum >> 8;
 	id_block[0x1f] = inv_sum & 0xff;
@@ -360,7 +362,7 @@ static void cpak_calc_id_crc(uint8_t* id_block) {
 
 static uint8_t cpak_calc_fat_crc(const uint8_t* page_data) {
 	uint8_t sum = 0;
-	// The overflow is intentional.
+	// The overflowing is done on purpose.
 	for (size_t i = 2; i < CPAK_PAGE_SIZE; i++) {
 		sum += page_data[i];
 	}
@@ -368,27 +370,33 @@ static uint8_t cpak_calc_fat_crc(const uint8_t* page_data) {
 }
 
 static void cpak_format(uint8_t* data) {
+	// Initialize the seed() function.
 	uint32_t seed;
 	int32_t rndfd = open("/dev/urandom", O_RDONLY);
 	read(rndfd, &seed, sizeof(seed));
 	close(rndfd);
 	srand(seed);
-
+	
 	memset(data, 0, get_save_size(MemoryType::CPAK));
 	uint8_t id_template[CPAK_ID_ENTRY_SIZE];
 	memset(id_template, 0, CPAK_ID_ENTRY_SIZE);
 
-	// 0x00-0x17 contains a serial number unique to the controller pak.
+	// (0x00-0x17) contains a serial number,
+	// unique for that controller pak.
+	// We fill (0x00-0x10) with random data.
 	for (size_t i = 0; i < 0x10; i++) {
 		id_template[i] = (uint8_t)(rand() & 0xff);
 	}
 
+	// The rest of the serial is some deterministic branding. :)
 	memcpy(&id_template[0x10], "MiSTer", 6);
-	id_template[0x19] = 0x81; // Device ID: controller pak
+
+	id_template[0x19] = 0x81; // Device ID. (controller pak)
 	id_template[0x1a] = 0x01; // 1 bank
 
 	cpak_calc_id_crc(id_template);
 
+	// Write ID block to the 4 specified locations in page 0.
 	const size_t p0_base = CPAK_ID_SECTOR_PAGE * CPAK_PAGE_SIZE;
 	memcpy(data + p0_base + CPAK_ID_ENTRY_1_OFFSET, id_template, CPAK_ID_ENTRY_SIZE);
 	memcpy(data + p0_base + CPAK_ID_ENTRY_2_OFFSET, id_template, CPAK_ID_ENTRY_SIZE);
@@ -398,6 +406,7 @@ static void cpak_format(uint8_t* data) {
 	uint8_t fat_page[CPAK_PAGE_SIZE];
 	memset(fat_page, 0, CPAK_PAGE_SIZE);
 
+	// Init the user entries (index 5 to 127) to (0x00, 0x03), repeating.
 	for (size_t i = 5; i < (CPAK_PAGE_SIZE >> 1); i++) {
 		fat_page[(i << 1) | 1] = 0x03;
 	}
@@ -1548,7 +1557,7 @@ void n64_poll() {
 	if (!poll_timer || CheckTimer(poll_timer)) {
 		if (!(loaded && is_fpga_ready(0))) {
 			poll_timer = GetTimer(1000);
-			//printf("Waiting for N64 game to be loaded...\n");
+			printf("Waiting for N64 game to be loaded...\n");
 			return;
 		}
 
