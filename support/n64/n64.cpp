@@ -1836,7 +1836,7 @@ static bool n64dd_write_vector_to_file(const char* save_path, const std::vector<
 			return false;
 		}
 		written += chunk;
-		ProgressMessage("Saving 64DD disk", save_path, written, total_size);
+		ProgressMessage("Saving", save_path, written, total_size);
 	}
 
 	FileClose(&save_file);
@@ -2318,7 +2318,7 @@ static bool n64dd_load_ram_save_to_mem(const char* save_path, const char* disk_p
 
 	std::vector<uint8_t> ram;
 	const bool read_ok = n64dd_copy_file_to_vector(&save_file, ram, N64DD_RAM_SIZE[disk_type],
-		"Loading 64DD RAM save", save_path);
+		"Loading", save_path);
 	FileClose(&save_file);
 	if (!read_ok) return false;
 
