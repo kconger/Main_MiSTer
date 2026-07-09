@@ -1520,7 +1520,6 @@ static constexpr const char* N64DD_IPL_US_BOOT_FILE = "boot5.rom";
 static constexpr const char* N64DD_IPL_DISK_FILE = "dd_bios.rom";
 static constexpr uint32_t N64DD_IPL_SIZE = 4 * 1024 * 1024;
 static constexpr uint32_t N64DD_NDD_SIZE = 0x03DEC800;
-static constexpr uint32_t N64DD_PHYSICAL_SIZE = 0x0435B0C0;
 static constexpr uint32_t N64DD_EXPANDED_SIZE = 0x06E28000;
 static constexpr uint32_t N64DD_SYSTEM_SECTOR_LENGTH = 232;
 static constexpr uint32_t N64DD_DEV_SYSTEM_SECTOR_LENGTH = 192;
@@ -1578,6 +1577,20 @@ static void n64dd_create_ram_save_path(char* save_path, const char* disk_path) {
 	if (ext) *ext = '\0';
 
 	snprintf(save_path, 1024, SAVE_DIR"/%s/%s.ram", CoreName2, base_name);
+}
+
+static const char* n64_leaf_name(const char* path) {
+	if (!path) return nullptr;
+	const char* slash = strrchr(path, '/');
+	const char* backslash = strrchr(path, '\\');
+	if (backslash && (!slash || backslash > slash)) slash = backslash;
+	return slash ? slash + 1 : path;
+}
+
+static void n64dd_progress(const char* title, const char* name, uint64_t current, uint64_t max) {
+	if (!title || !name || !max) return;
+	if (current > max) current = max;
+	ProgressMessage(title, n64_leaf_name(name), (int)current, (int)max);
 }
 
 static bool n64dd_save_ram_to_file(bool force) {
@@ -1679,11 +1692,6 @@ static constexpr uint8_t N64DD_VZONE_TO_PZONE[7][16] = {
 	{0, 1, 2, 3, 4, 5, 6, 7, 14, 13, 12, 11, 10, 9, 8, 15},
 	{0, 1, 2, 3, 4, 5, 6, 7, 15, 14, 13, 12, 11, 10, 9, 8},
 };
-static constexpr uint32_t N64DD_ZONE_START[16] = {
-	0x0000000, 0x05F15E0, 0x0B79D00, 0x10801A0, 0x1523720, 0x1963D80, 0x1D414C0, 0x20BBCE0,
-	0x23196E0, 0x28A1E00, 0x2DF5DC0, 0x3299340, 0x36D99A0, 0x3AB70E0, 0x3E31900, 0x4149200,
-};
-static constexpr uint16_t N64DD_TRACK_BASE[8] = {0x000, 0x09E, 0x13C, 0x1D1, 0x266, 0x2FB, 0x390, 0x425};
 static constexpr uint16_t N64DD_BLOCK_SIZE[16] = {
 	0x4D08, 0x47B8, 0x4510, 0x3FC0, 0x3A70, 0x3520, 0x2FD0, 0x2A80,
 	0x47B8, 0x4510, 0x3FC0, 0x3A70, 0x3520, 0x2FD0, 0x2A80, 0x2530,
@@ -1748,21 +1756,10 @@ static bool n64dd_copy_ipl_to_mem(fileTYPE* file, const char* name, uint8_t* ddi
 
 		copied += chunk;
 		is_first_chunk = false;
-		ProgressMessage("Loading", name, copied, size);
+		n64dd_progress("Loading", name, copied, size);
 	}
 
 	return true;
-}
-
-static uint32_t n64dd_expanded_offset(uint32_t track, uint32_t head, uint32_t block) {
-	uint32_t zone = 0;
-	for (uint32_t i = 1; i < 8; i++) {
-		if (track >= N64DD_TRACK_BASE[i]) zone = i;
-	}
-	if (head) zone += 8;
-
-	uint32_t track_in_zone = track - N64DD_TRACK_BASE[zone & 7];
-	return N64DD_ZONE_START[zone] + (N64DD_BLOCK_SIZE[zone] * 2 * track_in_zone) + (N64DD_BLOCK_SIZE[zone] * block);
 }
 
 static uint32_t n64dd_flat_offset(uint32_t track, uint32_t head, uint32_t block, uint32_t sector) {
@@ -1812,7 +1809,7 @@ static bool n64dd_copy_file_to_vector(fileTYPE* file, std::vector<uint8_t>& data
 		if (read < 0 || static_cast<uint32_t>(read) != chunk) return false;
 
 		copied += chunk;
-		if (progress_title) ProgressMessage(progress_title, progress_name, copied, expected_size);
+		if (progress_title) n64dd_progress(progress_title, progress_name, copied, expected_size);
 	}
 
 	return true;
@@ -1836,7 +1833,7 @@ static bool n64dd_write_vector_to_file(const char* save_path, const std::vector<
 			return false;
 		}
 		written += chunk;
-		ProgressMessage("Saving", save_path, written, total_size);
+		n64dd_progress("Saving", save_path, written, total_size);
 	}
 
 	FileClose(&save_file);
@@ -1902,29 +1899,6 @@ static bool n64dd_file_matches_vector(const char* path, const std::vector<uint8_
 	}
 
 	FileClose(&file);
-	return true;
-}
-
-static bool n64dd_pack_expanded_ndd(fileTYPE* file, uint8_t* dest, bool development) {
-	std::vector<uint8_t> block_data;
-
-	for (uint32_t pzone = 0; pzone < 16; pzone++) {
-		const auto& zone = N64DD_ZONES[pzone];
-
-		for (uint32_t zone_track = 0; zone_track < zone.tracks; zone_track++) {
-			const uint32_t track = zone.track_offset + zone_track;
-			const bool development_system_track = development && zone.head == 0 && (track == 1 || track == 5);
-			const uint32_t sector_length = development_system_track ? N64DD_DEV_SYSTEM_SECTOR_LENGTH : zone.sector_length;
-
-			for (uint32_t block = 0; block < 2; block++) {
-				const uint32_t source_offset = n64dd_expanded_offset(track, zone.head, block);
-				if (!n64dd_copy_block_to_flat(file, source_offset, dest, track, zone.head, block, sector_length, block_data)) {
-					return false;
-				}
-			}
-		}
-	}
-
 	return true;
 }
 
@@ -2056,7 +2030,7 @@ static bool n64dd_find_ndd_system_block(fileTYPE* file, std::vector<uint8_t>& sy
 }
 
 static bool n64dd_expand_ndd_to_flat(fileTYPE* file, uint8_t* dest, bool& cart_expansion_disk, char* disk_id,
-	uint8_t& disk_type, bool* development_out = nullptr) {
+	uint8_t& disk_type, bool* development_out = nullptr, const char* progress_name = nullptr) {
 	if (file->size != N64DD_NDD_SIZE) return false;
 
 	std::vector<uint8_t> sys_data;
@@ -2105,19 +2079,20 @@ static bool n64dd_expand_ndd_to_flat(fileTYPE* file, uint8_t* dest, bool& cart_e
 			}
 
 			for (uint32_t block = 0; block < 2; block++) {
-				const uint32_t physical_block = starting_block ^ block;
+				const uint32_t flat_block = starting_block ^ block;
 				if (lba >= bad_lbas.size()) return false;
 				const bool development_system_lba = development && (lba == 2 || lba == 3 || lba == 10 || lba == 11);
 				const uint32_t sector_length = development_system_lba ? N64DD_DEV_SYSTEM_SECTOR_LENGTH : zone.sector_length;
-				if (!n64dd_copy_block_to_flat(file, source_offset, dest, track, zone.head, physical_block, sector_length, block_data)) {
+				if (!n64dd_copy_block_to_flat(file, source_offset, dest, track, zone.head, flat_block, sector_length, block_data)) {
 					return false;
 				}
 				if (bad_lbas[lba]) {
-					if (!n64dd_mark_bad_flat_block(dest, track, zone.head, physical_block)) return false;
+					if (!n64dd_mark_bad_flat_block(dest, track, zone.head, flat_block)) return false;
 				}
 
 				source_offset += block_size;
 				lba++;
+				n64dd_progress("Loading", progress_name, source_offset, file->size);
 			}
 			starting_block ^= 1;
 		}
@@ -2506,23 +2481,13 @@ static int n64_dd_disk_tx(fileTYPE* file, const char* name, const unsigned char 
 	N64DDDiskRegion disk_region = N64DDDiskRegion::UNKNOWN;
 	uint8_t disk_type = 0;
 	char disk_id[5] = {};
-	if (file->size == N64DD_PHYSICAL_SIZE) {
-		printf("64DD disk loader: physical/MAME image, expanding to flat DDR layout (%u bytes).\n", N64DD_EXPANDED_SIZE);
-		std::vector<uint8_t> sys_data;
-		std::vector<uint8_t> bad_lbas;
-		if (n64dd_find_ndd_system_block(file, sys_data, disk_type, bad_lbas, disk_id, true, &development_disk)) {
-			printf("64DD disk: disk ID %.4s.\n", disk_id);
-			cart_expansion_disk = disk_id[0] == 'E';
-		} else if (n64dd_read_disk_id(file, disk_id)) {
-			printf("64DD disk: disk ID %.4s, disk type unknown.\n", disk_id);
-			cart_expansion_disk = disk_id[0] == 'E';
-		}
-		ok = n64dd_pack_expanded_ndd(file, mem, development_disk);
-	} else if (file->size == N64DD_NDD_SIZE) {
+	if (file->size == N64DD_NDD_SIZE) {
 		printf("64DD disk loader: compact NDD image, expanding to flat DDR layout (%u bytes).\n", N64DD_EXPANDED_SIZE);
-		ok = n64dd_expand_ndd_to_flat(file, mem, cart_expansion_disk, disk_id, disk_type, &development_disk);
+		ok = n64dd_expand_ndd_to_flat(file, mem, cart_expansion_disk, disk_id, disk_type, &development_disk, name);
 	} else {
-		printf("Unsupported 64DD disk image size: %llu bytes.\n", (unsigned long long)file->size);
+		printf("Unsupported 64DD disk image size: %llu bytes; expected compact NDD size %u.\n",
+			(unsigned long long)file->size,
+			(unsigned)N64DD_NDD_SIZE);
 	}
 
 	if (ok) {
@@ -2636,7 +2601,7 @@ int n64_rom_tx(const char* name, const unsigned char idx, const uint32_t load_ad
 
 			user_io_file_tx_data(buf, chunk);
 
-			ProgressMessage("Loading", f.name, data_size - data_left, data_size);
+			ProgressMessage("Loading", n64_leaf_name(f.name), data_size - data_left, data_size);
 			data_left -= chunk;
 		}
 
@@ -2786,7 +2751,7 @@ int n64_rom_tx(const char* name, const unsigned char idx, const uint32_t load_ad
 			user_io_file_tx_data(buf, chunk);
 		}
 
-		ProgressMessage("Loading", f.name, data_size - data_left, data_size);
+		ProgressMessage("Loading", n64_leaf_name(f.name), data_size - data_left, data_size);
 		data_left -= chunk;
 		is_first_chunk = false;
 
