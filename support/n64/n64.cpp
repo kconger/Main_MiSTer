@@ -121,6 +121,8 @@ enum class PadType : uint32_t {
 	N64_PAD_WITH_RPAK,
 	SNAC,
 	N64_PAD_WITH_TPAK,
+	KEYBOARD,
+	MOUSE,
 	UNKNOWN = ~0U
 };
 
@@ -779,7 +781,8 @@ static bool parse_and_apply_db_tags(char* tags) {
 	user_io_status_set(RTC_OPT, (uint32_t)rtc);
 	set_cart_save_type(save_type);
 
-	if (is_autopak() && ((PadType)user_io_status_get(CONTROLLER_OPTS[0]) != PadType::SNAC)) {
+	auto pad0 = (PadType)user_io_status_get(CONTROLLER_OPTS[0]);
+	if (is_autopak() && pad0 != PadType::SNAC && pad0 != PadType::KEYBOARD && pad0 != PadType::MOUSE) {
 		user_io_status_set(CONTROLLER_OPTS[0], (uint32_t)prefered_pad);
 	}
 
@@ -971,17 +974,14 @@ static bool detect_homebrew_header(const uint8_t* controller_settings, const cha
 		(controller_settings[2] == 0x02) ||
 		(controller_settings[3] == 0x02) ? 1 : 0)); // Controller Pak
 
-	user_io_status_set(TPAK_OPT, (uint32_t)(
-		(controller_settings[0] == 0x03) ||
-		(controller_settings[1] == 0x03) ||
-		(controller_settings[2] == 0x03) ||
-		(controller_settings[3] == 0x03) ? 1 : 0)); // Transfer Pak
+	user_io_status_set(TPAK_OPT, (uint32_t)(controller_settings[0] == 0x03 ? 1 : 0)); // Transfer Pak is P1 only
 
 	if (!is_autopak()) return true;
 
 	size_t c_idx = 0;
 	for (auto c_opt : CONTROLLER_OPTS) {
-		if (controller_settings[c_idx] && ((PadType)user_io_status_get(c_opt) != PadType::SNAC)) {
+		auto pad_type = (PadType)user_io_status_get(c_opt);
+		if (controller_settings[c_idx] && pad_type != PadType::SNAC && pad_type != PadType::KEYBOARD && pad_type != PadType::MOUSE) {
 			if (controller_settings[c_idx] < 0x80) {
 				user_io_status_set(c_opt, (uint32_t)(
 					(controller_settings[c_idx] == 0x01) ? PadType::N64_PAD_WITH_RPAK :
@@ -2535,7 +2535,7 @@ static int n64dd_autoload_ipl(const char* disk_path, bool boot_ipl, N64DDDiskReg
 			return 1;
 		}
 		if (!FileOpen(&ipl_file, boot_path, 1)) {
-			printf("64DD IPL autoload: root %s not found; keeping startup IPL.\n", root_ipl);
+			printf("64DD IPL autoload: root %s not found; keeping current IPL.\n", root_ipl);
 			return 1;
 		}
 	}
@@ -2992,16 +2992,6 @@ int n64_rom_tx(const char* name, const unsigned char idx, const uint32_t load_ad
 	}
 
 	return 1;
-}
-
-int n64_load_dd_ipl() {
-	char boot_path[1024];
-	snprintf(boot_path, sizeof(boot_path), "%s/%s", HomeDir(), N64DD_IPL_BOOT_FILE);
-	if (!FileExists(boot_path, 0)) return 0;
-
-	printf("64DD IPL startup: booting root IPL \"%s\".\n", boot_path);
-	uint32_t file_crc = 0;
-	return n64_rom_tx(boot_path, 4, N64DD_IPL_LOAD_ADDR, file_crc);
 }
 
 #pragma pop_macro("NONE")

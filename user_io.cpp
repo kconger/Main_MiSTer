@@ -389,7 +389,7 @@ char is_saturn()
 static int is_n64_type = 0;
 char is_n64()
 {
-	if (!is_n64_type) is_n64_type = (!strcasecmp(orig_name, "N64") || !strcasecmp(orig_name, "N64DD")) ? 1 : 2;
+	if (!is_n64_type) is_n64_type = strcasecmp(orig_name, "N64") ? 2 : 1;
 	return (is_n64_type == 1);
 }
 
@@ -1578,7 +1578,6 @@ void user_io_init(const char *path, const char *xml)
 
 					if (is_uneon()) x86_ide_set();
 					if (is_cdi()) cdi_load_root_nvram();
-					if (is_n64()) n64_load_dd_ipl();
 
 					if (!strlen(path) || !user_io_file_tx(path, 0, 0, 0, 1))
 					{
@@ -1587,7 +1586,7 @@ void user_io_init(const char *path, const char *xml)
 							// check for multipart rom
 							for (char i = (boot0_loaded ? 1 : 0); i < 4; i++)
 							{
-								if (is_n64() && i == 3) continue; // Loaded explicitly above with the 64DD DDR address.
+								if (is_n64() && i == 3) continue; // 64DD IPLs are loaded when an NDD is mounted.
 								sprintf(mainpath, "%s/boot%d.rom", home, i);
 								user_io_file_tx(mainpath, i << 6);
 							}
